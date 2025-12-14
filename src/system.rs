@@ -25,10 +25,6 @@ pub struct SystemData {
     // External block for comparison
     pub external_block: u64,
 
-    // Consensus info
-    pub epoch: u64,
-    pub round: u64,
-
     // System resources
     pub memory_used_pct: f64,
     pub memory_used_gb: f64,
@@ -57,10 +53,6 @@ impl SystemData {
 
     pub fn finalized_lag(&self) -> u64 {
         self.history_latest.saturating_sub(self.latest_finalized)
-    }
-
-    pub fn verified_lag(&self) -> u64 {
-        self.history_latest.saturating_sub(self.latest_verified)
     }
 
     pub fn all_services_running(&self) -> bool {

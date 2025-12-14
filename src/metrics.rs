@@ -29,20 +29,6 @@ impl PrometheusMetrics {
     pub fn is_synced(&self) -> bool {
         self.sync_percentage() >= 99.99
     }
-
-    pub fn uptime_human(&self) -> String {
-        let total_secs = self.uptime_us / 1_000_000;
-        let days = total_secs / 86400;
-        let hours = (total_secs % 86400) / 3600;
-        let mins = (total_secs % 3600) / 60;
-        if days > 0 {
-            format!("{}d {}h {}m", days, hours, mins)
-        } else if hours > 0 {
-            format!("{}h {}m", hours, mins)
-        } else {
-            format!("{}m", mins)
-        }
-    }
 }
 
 pub struct MetricsClient {
