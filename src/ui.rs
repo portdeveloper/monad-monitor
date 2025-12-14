@@ -9,10 +9,12 @@ use ratatui::{
 
 use crate::state::AppState;
 
-const MONAD_PURPLE: Color = Color::Rgb(130, 80, 220);
-const MONAD_ACCENT: Color = Color::Rgb(180, 140, 255);
-const LABEL_COLOR: Color = Color::Rgb(140, 140, 140);  // Labels and borders
-const TEXT_DIM: Color = Color::Rgb(180, 180, 180);     // Dimmed data text
+const MONAD_PURPLE: Color = Color::Rgb(100, 60, 180);
+const MONAD_ACCENT: Color = Color::Rgb(120, 80, 200);
+const TITLE_COLOR: Color = Color::Black;               // Titles
+const LABEL_COLOR: Color = Color::Rgb(80, 80, 80);     // Labels and borders
+const VALUE_COLOR: Color = Color::Rgb(40, 40, 40);     // Values - near black
+const TEXT_DIM: Color = Color::Rgb(60, 60, 60);        // Dimmed data text
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
@@ -40,7 +42,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
 fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" monad-monitor ")
-        .title_style(Style::default().fg(MONAD_PURPLE).bold())
+        .title_style(Style::default().fg(TITLE_COLOR).bold())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(LABEL_COLOR));
 
@@ -82,7 +84,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(LABEL_COLOR))),
         Line::from(Span::styled(
             format_number(block_num),
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(VALUE_COLOR).bold(),
         )),
         Line::from(vec![
             Span::styled("✓ ", Style::default().fg(sync_color)),
@@ -105,7 +107,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(Span::styled("PEERS", Style::default().fg(LABEL_COLOR))),
         Line::from(Span::styled(
             format!("{}", peer_count),
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(VALUE_COLOR).bold(),
         )),
         Line::from(vec![
             Span::styled("↑ ", Style::default().fg(peer_color)),
@@ -193,7 +195,7 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(format!(" (ver -{})", ver_lag), Style::default().fg(LABEL_COLOR)),
         Span::raw("  │  "),
         Span::styled("HISTORY: ", Style::default().fg(LABEL_COLOR)),
-        Span::styled(history_str, Style::default().fg(Color::White)),
+        Span::styled(history_str, Style::default().fg(VALUE_COLOR)),
     ]);
 
     frame.render_widget(Paragraph::new(stats), inner);
@@ -332,13 +334,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let footer = Line::from(vec![
         Span::styled("UPTIME: ", Style::default().fg(LABEL_COLOR)),
-        Span::styled(uptime, Style::default().fg(Color::White)),
+        Span::styled(uptime, Style::default().fg(VALUE_COLOR)),
         Span::raw("  │  "),
         Span::styled("PENDING: ", Style::default().fg(LABEL_COLOR)),
-        Span::styled(format!("{} tx", pending), Style::default().fg(Color::White)),
+        Span::styled(format!("{} tx", pending), Style::default().fg(VALUE_COLOR)),
         Span::raw("  │  "),
         Span::styled("GAS: ", Style::default().fg(LABEL_COLOR)),
-        Span::styled(format!("{:.0}gwei", gas_gwei), Style::default().fg(Color::White)),
+        Span::styled(format!("{:.0}gwei", gas_gwei), Style::default().fg(VALUE_COLOR)),
         Span::raw("  │  "),
         Span::styled(version, Style::default().fg(LABEL_COLOR)),
         Span::raw("  │  "),
