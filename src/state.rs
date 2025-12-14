@@ -8,6 +8,16 @@ use crate::system::SystemData;
 const TPS_HISTORY_SIZE: usize = 300; // 5 minutes of history (fills wide terminals)
 const SAMPLE_HISTORY_SIZE: usize = 10; // Keep last 10 samples for TPS calculation
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Theme {
+    #[default]
+    Gray,
+    Light,
+    Monad,      // Purple-heavy brand theme
+    Matrix,     // Green on black hacker style
+    Ocean,      // Blue tones
+}
+
 #[derive(Debug, Clone)]
 struct TxSample {
     tx_commits: u64,
@@ -36,8 +46,17 @@ pub struct AppState {
     latency_prev: u64,
     peers_prev: u64,
 
+    // Network rate tracking
+    net_rx_prev: u64,
+    net_tx_prev: u64,
+    pub net_rx_rate: f64, // bytes per second
+    pub net_tx_rate: f64,
+
     // Error tracking
     pub last_error: Option<String>,
+
+    // UI theme
+    pub theme: Theme,
 }
 
 impl Default for AppState {
@@ -62,7 +81,32 @@ impl AppState {
             last_block_number: 0,
             latency_prev: 0,
             peers_prev: 0,
+            net_rx_prev: 0,
+            net_tx_prev: 0,
+            net_rx_rate: 0.0,
+            net_tx_rate: 0.0,
             last_error: None,
+            theme: Theme::Gray,
+        }
+    }
+
+    pub fn toggle_theme(&mut self) {
+        self.theme = match self.theme {
+            Theme::Gray => Theme::Light,
+            Theme::Light => Theme::Monad,
+            Theme::Monad => Theme::Matrix,
+            Theme::Matrix => Theme::Ocean,
+            Theme::Ocean => Theme::Gray,
+        };
+    }
+
+    pub fn theme_name(&self) -> &'static str {
+        match self.theme {
+            Theme::Gray => "gray",
+            Theme::Light => "light",
+            Theme::Monad => "monad",
+            Theme::Matrix => "matrix",
+            Theme::Ocean => "ocean",
         }
     }
 
@@ -119,6 +163,20 @@ impl AppState {
     }
 
     pub fn update_system(&mut self, system: SystemData) {
+        // Calculate network rates (bytes per second)
+        // System updates every 5 seconds
+        const UPDATE_INTERVAL_SECS: f64 = 5.0;
+
+        if self.net_rx_prev > 0 && system.net_rx_bytes > self.net_rx_prev {
+            self.net_rx_rate = (system.net_rx_bytes - self.net_rx_prev) as f64 / UPDATE_INTERVAL_SECS;
+        }
+        if self.net_tx_prev > 0 && system.net_tx_bytes > self.net_tx_prev {
+            self.net_tx_rate = (system.net_tx_bytes - self.net_tx_prev) as f64 / UPDATE_INTERVAL_SECS;
+        }
+
+        self.net_rx_prev = system.net_rx_bytes;
+        self.net_tx_prev = system.net_tx_bytes;
+
         self.system = system;
     }
 
@@ -241,6 +299,19 @@ impl AppState {
             -1
         } else {
             0
+        }
+    }
+
+    /// Format bytes per second as human readable
+    pub fn format_bandwidth(bytes_per_sec: f64) -> String {
+        if bytes_per_sec >= 1_000_000_000.0 {
+            format!("{:.1}GB/s", bytes_per_sec / 1_000_000_000.0)
+        } else if bytes_per_sec >= 1_000_000.0 {
+            format!("{:.1}MB/s", bytes_per_sec / 1_000_000.0)
+        } else if bytes_per_sec >= 1_000.0 {
+            format!("{:.0}KB/s", bytes_per_sec / 1_000.0)
+        } else {
+            format!("{:.0}B/s", bytes_per_sec)
         }
     }
 }

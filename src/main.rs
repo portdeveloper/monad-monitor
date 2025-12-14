@@ -132,6 +132,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                                 return Ok(());
                             }
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                state.toggle_theme();
+                            }
                             _ => {}
                         }
                     }
