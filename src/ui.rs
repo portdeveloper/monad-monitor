@@ -65,6 +65,11 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
     let (title_color, label_color, value_color, text_dim, sparkline_color) = get_colors(state.theme);
 
+    // Draw festive lights border for Christmas theme
+    if state.theme == Theme::Christmas {
+        draw_festive_lights(frame, area);
+    }
+
     // Main layout: header, secondary stats, sparkline, blocks, footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -83,6 +88,71 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     draw_sparkline(frame, chunks[2], state, label_color, sparkline_color);
     draw_blocks(frame, chunks[3], state, label_color, text_dim);
     draw_footer(frame, chunks[4], state, label_color, value_color);
+}
+
+fn draw_festive_lights(frame: &mut Frame, area: Rect) {
+    // Subtle light colors (slightly dimmer)
+    let light_colors = [
+        Color::Rgb(220, 50, 50),    // Red
+        Color::Rgb(220, 180, 0),    // Gold
+        Color::Rgb(50, 160, 220),   // Blue
+        Color::Rgb(50, 180, 50),    // Green
+        Color::Rgb(220, 100, 160),  // Pink
+    ];
+
+    // Slow time-based offset for gentle twinkling
+    let tick = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() / 1000)
+        .unwrap_or(0)) as usize;
+
+    let width = area.width as usize;
+    let height = area.height as usize;
+
+    // Draw sparse lights around the border
+    for x in 0..width {
+        // Top edge - every 3rd position
+        if x % 3 == 0 {
+            let color_idx = (x / 3 + tick) % light_colors.len();
+            let bright = ((x / 3 + tick) % 4) != 0;  // 75% on
+            if bright {
+                let span = Span::styled("*", Style::default().fg(light_colors[color_idx]));
+                frame.render_widget(Paragraph::new(span), Rect::new(area.x + x as u16, area.y, 1, 1));
+            }
+        }
+
+        // Bottom edge - every 3rd position, offset
+        if (x + 1) % 3 == 0 {
+            let color_idx = (x / 3 + tick + 2) % light_colors.len();
+            let bright = ((x / 3 + tick + 1) % 4) != 0;
+            if bright {
+                let span = Span::styled("*", Style::default().fg(light_colors[color_idx]));
+                frame.render_widget(Paragraph::new(span), Rect::new(area.x + x as u16, area.y + area.height - 1, 1, 1));
+            }
+        }
+    }
+
+    for y in 1..height.saturating_sub(1) {
+        // Left edge - every 2nd position
+        if y % 2 == 0 {
+            let color_idx = (y / 2 + tick + 1) % light_colors.len();
+            let bright = ((y / 2 + tick) % 4) != 0;
+            if bright {
+                let span = Span::styled("*", Style::default().fg(light_colors[color_idx]));
+                frame.render_widget(Paragraph::new(span), Rect::new(area.x, area.y + y as u16, 1, 1));
+            }
+        }
+
+        // Right edge - every 2nd position, offset
+        if (y + 1) % 2 == 0 {
+            let color_idx = (y / 2 + tick + 3) % light_colors.len();
+            let bright = ((y / 2 + tick + 2) % 4) != 0;
+            if bright {
+                let span = Span::styled("*", Style::default().fg(light_colors[color_idx]));
+                frame.render_widget(Paragraph::new(span), Rect::new(area.x + area.width - 1, area.y + y as u16, 1, 1));
+            }
+        }
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Color, label_color: Color, value_color: Color) {
