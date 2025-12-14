@@ -15,9 +15,9 @@ const MONAD_LIGHT: Color = Color::Rgb(221, 215, 254);   // #DDD7FE
 const MONAD_DARK: Color = Color::Rgb(14, 9, 28);        // #0E091C
 
 const TITLE_COLOR: Color = MONAD_PRIMARY;               // Titles in brand purple
-const LABEL_COLOR: Color = Color::Rgb(80, 80, 80);      // Labels and borders
-const VALUE_COLOR: Color = Color::Rgb(40, 40, 40);      // Values - near black
-const TEXT_DIM: Color = Color::Rgb(60, 60, 60);         // Dimmed data text
+const LABEL_COLOR: Color = Color::Rgb(160, 160, 160);   // Labels and borders
+const VALUE_COLOR: Color = Color::Rgb(220, 220, 220);   // Values - bright
+const TEXT_DIM: Color = Color::Rgb(180, 180, 180);      // Dimmed data text
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
