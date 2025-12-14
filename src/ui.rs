@@ -40,7 +40,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         .title(" monad-monitor ")
         .title_style(Style::default().fg(MONAD_PURPLE).bold())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Gray));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -77,7 +77,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let block_text = vec![
-        Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(Color::Gray))),
         Line::from(Span::styled(
             format_number(block_num),
             Style::default().fg(Color::White).bold(),
@@ -85,7 +85,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![
             Span::styled("✓ ", Style::default().fg(sync_color)),
             Span::styled(sync_status, Style::default().fg(sync_color)),
-            Span::styled(format!(" ({})", diff_str), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" ({})", diff_str), Style::default().fg(Color::Gray)),
         ]),
     ];
     frame.render_widget(Paragraph::new(block_text).alignment(Alignment::Center), columns[0]);
@@ -100,7 +100,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let peer_text = vec![
-        Line::from(Span::styled("PEERS", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("PEERS", Style::default().fg(Color::Gray))),
         Line::from(Span::styled(
             format!("{}", peer_count),
             Style::default().fg(Color::White).bold(),
@@ -115,12 +115,12 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     // TPS
     let tps = state.tps;
     let tps_text = vec![
-        Line::from(Span::styled("TPS", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("TPS", Style::default().fg(Color::Gray))),
         Line::from(Span::styled(
             format!("{:.0}", tps),
             Style::default().fg(MONAD_ACCENT).bold(),
         )),
-        Line::from(Span::styled("tx/sec", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("tx/sec", Style::default().fg(Color::Gray))),
     ];
     frame.render_widget(Paragraph::new(tps_text).alignment(Alignment::Center), columns[2]);
 
@@ -135,12 +135,12 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let latency_text = vec![
-        Line::from(Span::styled("LATENCY", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("LATENCY", Style::default().fg(Color::Gray))),
         Line::from(Span::styled(
             format!("{}ms", latency),
             Style::default().fg(latency_color).bold(),
         )),
-        Line::from(Span::styled("p99", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("p99", Style::default().fg(Color::Gray))),
     ];
     frame.render_widget(Paragraph::new(latency_text).alignment(Alignment::Center), columns[3]);
 }
@@ -148,7 +148,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Gray));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -179,18 +179,18 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
     let history_str = format!("{} blocks", format_number(sys.history_count));
 
     let stats = Line::from(vec![
-        Span::styled("DISK: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("DISK: ", Style::default().fg(Color::Gray)),
         Span::styled(format!("{:.1}%", sys.disk_used_pct), Style::default().fg(disk_color)),
-        Span::styled(format!(" ({:.0}GB)", sys.disk_used_gb), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" ({:.0}GB)", sys.disk_used_gb), Style::default().fg(Color::Gray)),
         Span::raw("  │  "),
-        Span::styled("SERVICES: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("SERVICES: ", Style::default().fg(Color::Gray)),
         Span::styled(services_str, Style::default().fg(services_color)),
         Span::raw("  │  "),
-        Span::styled("FINALIZED: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("FINALIZED: ", Style::default().fg(Color::Gray)),
         Span::styled(format!("-{}", fin_lag), Style::default().fg(lag_color)),
-        Span::styled(format!(" (ver -{})", ver_lag), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" (ver -{})", ver_lag), Style::default().fg(Color::Gray)),
         Span::raw("  │  "),
-        Span::styled("HISTORY: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("HISTORY: ", Style::default().fg(Color::Gray)),
         Span::styled(history_str, Style::default().fg(Color::White)),
     ]);
 
@@ -200,9 +200,9 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_sparkline(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" TPS ")
-        .title_style(Style::default().fg(Color::DarkGray))
+        .title_style(Style::default().fg(Color::Gray))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Gray));
 
     // Calculate available width (subtract 2 for borders)
     let available_width = area.width.saturating_sub(2) as usize;
@@ -229,9 +229,9 @@ fn draw_sparkline(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" RECENT BLOCKS ")
-        .title_style(Style::default().fg(Color::DarkGray))
+        .title_style(Style::default().fg(Color::Gray))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Gray));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -286,7 +286,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
     let table = Table::new(rows, widths)
         .header(
             Row::new(vec!["BLOCK", "TXS", "HASH", "GAS", "AGE"])
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
         )
         .column_spacing(2);
 
@@ -296,7 +296,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Gray));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -325,24 +325,24 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             .time_since_last_block()
             .map(|d| format!("{:.1}s", d.as_secs_f64()))
             .unwrap_or_else(|| "...".to_string());
-        Span::styled(format!("last: {}", time_since), Style::default().fg(Color::DarkGray))
+        Span::styled(format!("last: {}", time_since), Style::default().fg(Color::Gray))
     };
 
     let footer = Line::from(vec![
-        Span::styled("UPTIME: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("UPTIME: ", Style::default().fg(Color::Gray)),
         Span::styled(uptime, Style::default().fg(Color::White)),
         Span::raw("  │  "),
-        Span::styled("PENDING: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("PENDING: ", Style::default().fg(Color::Gray)),
         Span::styled(format!("{} tx", pending), Style::default().fg(Color::White)),
         Span::raw("  │  "),
-        Span::styled("GAS: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("GAS: ", Style::default().fg(Color::Gray)),
         Span::styled(format!("{:.0}gwei", gas_gwei), Style::default().fg(Color::White)),
         Span::raw("  │  "),
-        Span::styled(version, Style::default().fg(Color::DarkGray)),
+        Span::styled(version, Style::default().fg(Color::Gray)),
         Span::raw("  │  "),
         status,
         Span::raw("  │  "),
-        Span::styled("q: quit", Style::default().fg(Color::DarkGray)),
+        Span::styled("q: quit", Style::default().fg(Color::Gray)),
     ]);
 
     frame.render_widget(Paragraph::new(footer), inner);
