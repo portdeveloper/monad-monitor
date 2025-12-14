@@ -11,6 +11,8 @@ use crate::state::AppState;
 
 const MONAD_PURPLE: Color = Color::Rgb(130, 80, 220);
 const MONAD_ACCENT: Color = Color::Rgb(180, 140, 255);
+const LABEL_COLOR: Color = Color::Rgb(140, 140, 140);  // Labels and borders
+const TEXT_DIM: Color = Color::Rgb(180, 180, 180);     // Dimmed data text
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
@@ -40,7 +42,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         .title(" monad-monitor ")
         .title_style(Style::default().fg(MONAD_PURPLE).bold())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(LABEL_COLOR));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -77,7 +79,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let block_text = vec![
-        Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(LABEL_COLOR))),
         Line::from(Span::styled(
             format_number(block_num),
             Style::default().fg(Color::White).bold(),
@@ -85,7 +87,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![
             Span::styled("✓ ", Style::default().fg(sync_color)),
             Span::styled(sync_status, Style::default().fg(sync_color)),
-            Span::styled(format!(" ({})", diff_str), Style::default().fg(Color::Gray)),
+            Span::styled(format!(" ({})", diff_str), Style::default().fg(LABEL_COLOR)),
         ]),
     ];
     frame.render_widget(Paragraph::new(block_text).alignment(Alignment::Center), columns[0]);
@@ -100,7 +102,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let peer_text = vec![
-        Line::from(Span::styled("PEERS", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("PEERS", Style::default().fg(LABEL_COLOR))),
         Line::from(Span::styled(
             format!("{}", peer_count),
             Style::default().fg(Color::White).bold(),
@@ -115,12 +117,12 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     // TPS
     let tps = state.tps;
     let tps_text = vec![
-        Line::from(Span::styled("TPS", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("TPS", Style::default().fg(LABEL_COLOR))),
         Line::from(Span::styled(
             format!("{:.0}", tps),
             Style::default().fg(MONAD_ACCENT).bold(),
         )),
-        Line::from(Span::styled("tx/sec", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("tx/sec", Style::default().fg(LABEL_COLOR))),
     ];
     frame.render_widget(Paragraph::new(tps_text).alignment(Alignment::Center), columns[2]);
 
@@ -135,12 +137,12 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let latency_text = vec![
-        Line::from(Span::styled("LATENCY", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("LATENCY", Style::default().fg(LABEL_COLOR))),
         Line::from(Span::styled(
             format!("{}ms", latency),
             Style::default().fg(latency_color).bold(),
         )),
-        Line::from(Span::styled("p99", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("p99", Style::default().fg(LABEL_COLOR))),
     ];
     frame.render_widget(Paragraph::new(latency_text).alignment(Alignment::Center), columns[3]);
 }
@@ -148,7 +150,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(LABEL_COLOR));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -179,18 +181,18 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
     let history_str = format!("{} blocks", format_number(sys.history_count));
 
     let stats = Line::from(vec![
-        Span::styled("DISK: ", Style::default().fg(Color::Gray)),
+        Span::styled("DISK: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(format!("{:.1}%", sys.disk_used_pct), Style::default().fg(disk_color)),
-        Span::styled(format!(" ({:.0}GB)", sys.disk_used_gb), Style::default().fg(Color::Gray)),
+        Span::styled(format!(" ({:.0}GB)", sys.disk_used_gb), Style::default().fg(LABEL_COLOR)),
         Span::raw("  │  "),
-        Span::styled("SERVICES: ", Style::default().fg(Color::Gray)),
+        Span::styled("SERVICES: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(services_str, Style::default().fg(services_color)),
         Span::raw("  │  "),
-        Span::styled("FINALIZED: ", Style::default().fg(Color::Gray)),
+        Span::styled("FINALIZED: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(format!("-{}", fin_lag), Style::default().fg(lag_color)),
-        Span::styled(format!(" (ver -{})", ver_lag), Style::default().fg(Color::Gray)),
+        Span::styled(format!(" (ver -{})", ver_lag), Style::default().fg(LABEL_COLOR)),
         Span::raw("  │  "),
-        Span::styled("HISTORY: ", Style::default().fg(Color::Gray)),
+        Span::styled("HISTORY: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(history_str, Style::default().fg(Color::White)),
     ]);
 
@@ -200,9 +202,9 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_sparkline(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" TPS ")
-        .title_style(Style::default().fg(Color::Gray))
+        .title_style(Style::default().fg(LABEL_COLOR))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(LABEL_COLOR));
 
     // Calculate available width (subtract 2 for borders)
     let available_width = area.width.saturating_sub(2) as usize;
@@ -229,9 +231,9 @@ fn draw_sparkline(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" RECENT BLOCKS ")
-        .title_style(Style::default().fg(Color::Gray))
+        .title_style(Style::default().fg(LABEL_COLOR))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(LABEL_COLOR));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -271,7 +273,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
                 format!("{:.0}% gas", gas_pct),
                 age,
             ])
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(TEXT_DIM))
         })
         .collect();
 
@@ -286,7 +288,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
     let table = Table::new(rows, widths)
         .header(
             Row::new(vec!["BLOCK", "TXS", "HASH", "GAS", "AGE"])
-                .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+                .style(Style::default().fg(LABEL_COLOR).add_modifier(Modifier::BOLD)),
         )
         .column_spacing(2);
 
@@ -296,7 +298,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(LABEL_COLOR));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -325,24 +327,24 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             .time_since_last_block()
             .map(|d| format!("{:.1}s", d.as_secs_f64()))
             .unwrap_or_else(|| "...".to_string());
-        Span::styled(format!("last: {}", time_since), Style::default().fg(Color::Gray))
+        Span::styled(format!("last: {}", time_since), Style::default().fg(LABEL_COLOR))
     };
 
     let footer = Line::from(vec![
-        Span::styled("UPTIME: ", Style::default().fg(Color::Gray)),
+        Span::styled("UPTIME: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(uptime, Style::default().fg(Color::White)),
         Span::raw("  │  "),
-        Span::styled("PENDING: ", Style::default().fg(Color::Gray)),
+        Span::styled("PENDING: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(format!("{} tx", pending), Style::default().fg(Color::White)),
         Span::raw("  │  "),
-        Span::styled("GAS: ", Style::default().fg(Color::Gray)),
+        Span::styled("GAS: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(format!("{:.0}gwei", gas_gwei), Style::default().fg(Color::White)),
         Span::raw("  │  "),
-        Span::styled(version, Style::default().fg(Color::Gray)),
+        Span::styled(version, Style::default().fg(LABEL_COLOR)),
         Span::raw("  │  "),
         status,
         Span::raw("  │  "),
-        Span::styled("q: quit", Style::default().fg(Color::Gray)),
+        Span::styled("q: quit", Style::default().fg(LABEL_COLOR)),
     ]);
 
     frame.render_widget(Paragraph::new(footer), inner);
