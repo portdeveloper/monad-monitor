@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "A lightweight TUI monitor for Monad nodes"
 license = "MIT"
+repository = "https://github.com/portdeveloper/monad-monitor"
+homepage = "https://github.com/portdeveloper/monad-monitor"
+readme = "README.md"
+keywords = ["monad", "blockchain", "tui", "monitor", "terminal"]
+categories = ["command-line-utilities", "visualization"]
 
 [dependencies]
 # Async runtime
