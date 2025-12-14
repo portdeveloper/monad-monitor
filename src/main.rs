@@ -115,11 +115,14 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     // Create async event stream for keyboard
     let mut event_stream = crossterm::event::EventStream::new();
 
+    // UI refresh ticker for smooth animations (100ms = 10fps)
+    let mut ui_ticker = interval(Duration::from_millis(100));
+
     loop {
         // Draw UI
         terminal.draw(|frame| ui::draw(frame, &state))?;
 
-        // Wait for either keyboard input or data update
+        // Wait for keyboard input, data update, or UI tick
         tokio::select! {
             // Handle keyboard events (highest priority)
             maybe_event = event_stream.next() => {
@@ -145,6 +148,11 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     DataUpdate::System(Ok(system)) => state.update_system(system),
                     DataUpdate::System(Err(e)) => state.set_error(format!("system: {}", e)),
                 }
+            }
+
+            // UI refresh tick for animations
+            _ = ui_ticker.tick() => {
+                // Just triggers a redraw
             }
         }
     }

@@ -24,11 +24,16 @@ pub struct AppState {
     tx_samples: VecDeque<TxSample>,
     pub tps: f64,
     pub tps_history: VecDeque<u64>,
+    pub tps_peak: f64,
+    tps_prev: f64,
 
     // Timing
     pub last_update: Instant,
     pub last_block_time: Option<Instant>,
     last_block_number: u64,
+
+    // Latency tracking
+    latency_prev: u64,
 
     // Error tracking
     pub last_error: Option<String>,
@@ -49,9 +54,12 @@ impl AppState {
             tx_samples: VecDeque::with_capacity(SAMPLE_HISTORY_SIZE),
             tps: 0.0,
             tps_history: VecDeque::with_capacity(TPS_HISTORY_SIZE),
+            tps_peak: 0.0,
+            tps_prev: 0.0,
             last_update: Instant::now(),
             last_block_time: None,
             last_block_number: 0,
+            latency_prev: 0,
             last_error: None,
         }
     }
@@ -87,6 +95,9 @@ impl AppState {
         // Calculate TPS from samples
         self.calculate_tps();
 
+        // Track latency for trend
+        self.latency_prev = self.metrics.latency_p99_ms;
+
         self.metrics = metrics;
         self.last_update = Instant::now();
         self.last_error = None;
@@ -120,7 +131,13 @@ impl AppState {
         let time_delta_ms = newest.timestamp_ms.saturating_sub(oldest.timestamp_ms);
 
         if time_delta_ms > 0 {
+            self.tps_prev = self.tps;
             self.tps = (tx_delta as f64 / time_delta_ms as f64) * 1000.0;
+
+            // Track peak TPS
+            if self.tps > self.tps_peak {
+                self.tps_peak = self.tps;
+            }
 
             // Add to history for sparkline (capped at reasonable value for display)
             let tps_capped = (self.tps.min(10000.0)) as u64;
@@ -170,6 +187,44 @@ impl AppState {
             1..=10 => "low",
             11..=50 => "ok",
             _ => "healthy",
+        }
+    }
+
+    /// Returns pulse intensity from 0.0 to 1.0 based on how recently a block arrived
+    /// 1.0 = just now, fades to 0.0 over ~1 second
+    pub fn pulse_intensity(&self) -> f64 {
+        match self.last_block_time {
+            Some(t) => {
+                let elapsed_ms = t.elapsed().as_millis() as f64;
+                let fade_duration_ms = 1000.0;
+                (1.0 - (elapsed_ms / fade_duration_ms)).max(0.0)
+            }
+            None => 0.0,
+        }
+    }
+
+    /// Returns TPS trend: 1 = up, -1 = down, 0 = stable
+    pub fn tps_trend(&self) -> i8 {
+        let threshold = 50.0; // Need 50 TPS difference to show trend
+        if self.tps > self.tps_prev + threshold {
+            1
+        } else if self.tps < self.tps_prev - threshold {
+            -1
+        } else {
+            0
+        }
+    }
+
+    /// Returns latency trend: 1 = worsening, -1 = improving, 0 = stable
+    pub fn latency_trend(&self) -> i8 {
+        let current = self.metrics.latency_p99_ms;
+        let threshold = 20; // Need 20ms difference to show trend
+        if current > self.latency_prev + threshold {
+            1 // Getting worse
+        } else if current + threshold < self.latency_prev {
+            -1 // Improving
+        } else {
+            0
         }
     }
 }
