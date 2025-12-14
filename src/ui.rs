@@ -112,21 +112,28 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     ];
     frame.render_widget(Paragraph::new(block_text).alignment(Alignment::Center), columns[0]);
 
-    // Peers
+    // Peers with trend
     let peer_count = state.metrics.peer_count;
     let peer_health = state.peer_health();
+    let peers_trend = state.peers_trend();
     let peer_color = match peer_health {
         "healthy" => Color::Green,
         "ok" => Color::Yellow,
         _ => Color::Red,
     };
 
+    let (peer_trend_arrow, peer_trend_color) = match peers_trend {
+        1 => ("▲", Color::Green),   // More peers = good
+        -1 => ("▼", Color::Red),    // Fewer peers = bad
+        _ => ("", LABEL_COLOR),
+    };
+
     let peer_text = vec![
         Line::from(Span::styled("PEERS", Style::default().fg(LABEL_COLOR))),
-        Line::from(Span::styled(
-            format!("{}", peer_count),
-            Style::default().fg(VALUE_COLOR).bold(),
-        )),
+        Line::from(vec![
+            Span::styled(format!("{}", peer_count), Style::default().fg(VALUE_COLOR).bold()),
+            Span::styled(format!(" {}", peer_trend_arrow), Style::default().fg(peer_trend_color)),
+        ]),
         Line::from(vec![
             Span::styled("↑ ", Style::default().fg(peer_color)),
             Span::styled(peer_health, Style::default().fg(peer_color)),
@@ -138,7 +145,6 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let tps = state.tps;
     let tps_peak = state.tps_peak;
     let tps_trend = state.tps_trend();
-    let is_new_peak = (tps - tps_peak).abs() < 1.0 && tps_peak > 0.0;
 
     let (trend_arrow, trend_color) = match tps_trend {
         1 => ("▲", Color::Green),
@@ -152,11 +158,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(format!("{:.0}", tps), Style::default().fg(MONAD_PRIMARY).bold()),
             Span::styled(format!(" {}", trend_arrow), Style::default().fg(trend_color)),
         ]),
-        Line::from(if is_new_peak {
-            Span::styled("★ NEW PEAK", Style::default().fg(Color::Yellow).bold())
-        } else {
-            Span::styled(format!("peak: {:.0}", tps_peak), Style::default().fg(LABEL_COLOR))
-        }),
+        Line::from(Span::styled(format!("peak: {:.0}", tps_peak), Style::default().fg(LABEL_COLOR))),
     ];
     frame.render_widget(Paragraph::new(tps_text).alignment(Alignment::Center), columns[2]);
 
@@ -226,14 +228,14 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("DISK: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(format!("{:.1}%", sys.disk_used_pct), Style::default().fg(disk_color)),
         Span::styled(format!(" ({:.0}GB)", sys.disk_used_gb), Style::default().fg(LABEL_COLOR)),
-        Span::raw("  │  "),
+        Span::raw("  |  "),
         Span::styled("SERVICES: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(services_str, Style::default().fg(services_color)),
-        Span::raw("  │  "),
+        Span::raw("  |  "),
         Span::styled("FINALIZED: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(format!("-{}", fin_lag), Style::default().fg(lag_color)),
         Span::styled(format!(" (ver -{})", ver_lag), Style::default().fg(LABEL_COLOR)),
-        Span::raw("  │  "),
+        Span::raw("  |  "),
         Span::styled("HISTORY: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(history_str, Style::default().fg(VALUE_COLOR)),
     ]);
@@ -295,19 +297,9 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Check if newest block is fresh (for highlight effect)
-    let pulse = state.pulse_intensity();
-
     let rows: Vec<Row> = blocks_to_show
         .iter()
-        .enumerate()
-        .map(|(idx, b)| {
-            // Highlight newest block when fresh
-            let row_color = if idx == 0 && pulse > 0.3 {
-                MONAD_PRIMARY
-            } else {
-                TEXT_DIM
-            };
+        .map(|b| {
             let hash_display = if wide_mode {
                 b.hash.clone()
             } else if b.hash.len() > 14 {
@@ -345,7 +337,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
                 gas_bar,
                 age,
             ])
-            .style(Style::default().fg(row_color))
+            .style(Style::default().fg(TEXT_DIM))
         })
         .collect();
 
@@ -402,14 +394,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let footer = Line::from(vec![
         Span::styled("UPTIME: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(uptime, Style::default().fg(VALUE_COLOR)),
-        Span::raw("  │  "),
+        Span::raw("  |  "),
         Span::styled("GAS: ", Style::default().fg(LABEL_COLOR)),
         Span::styled(format!("{:.0}gwei", gas_gwei), Style::default().fg(VALUE_COLOR)),
-        Span::raw("  │  "),
+        Span::raw("  |  "),
         Span::styled(version, Style::default().fg(LABEL_COLOR)),
-        Span::raw("  │  "),
+        Span::raw("  |  "),
         status,
-        Span::raw("  │  "),
+        Span::raw("  |  "),
         Span::styled("q: quit", Style::default().fg(LABEL_COLOR)),
     ]);
 

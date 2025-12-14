@@ -34,6 +34,7 @@ pub struct AppState {
 
     // Latency tracking
     latency_prev: u64,
+    peers_prev: u64,
 
     // Error tracking
     pub last_error: Option<String>,
@@ -60,6 +61,7 @@ impl AppState {
             last_block_time: None,
             last_block_number: 0,
             latency_prev: 0,
+            peers_prev: 0,
             last_error: None,
         }
     }
@@ -95,8 +97,9 @@ impl AppState {
         // Calculate TPS from samples
         self.calculate_tps();
 
-        // Track latency for trend
+        // Track latency and peers for trend
         self.latency_prev = self.metrics.latency_p99_ms;
+        self.peers_prev = self.metrics.peer_count;
 
         self.metrics = metrics;
         self.last_update = Instant::now();
@@ -223,6 +226,19 @@ impl AppState {
             1 // Getting worse
         } else if current + threshold < self.latency_prev {
             -1 // Improving
+        } else {
+            0
+        }
+    }
+
+    /// Returns peer count trend: 1 = up, -1 = down, 0 = stable
+    pub fn peers_trend(&self) -> i8 {
+        let current = self.metrics.peer_count;
+        let threshold = 5; // Need 5 peer difference to show trend
+        if current > self.peers_prev + threshold {
+            1
+        } else if current + threshold < self.peers_prev {
+            -1
         } else {
             0
         }
