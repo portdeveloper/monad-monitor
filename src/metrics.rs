@@ -10,6 +10,11 @@ pub struct PrometheusMetrics {
     pub peer_count: u64,
     pub statesync_progress: u64,
     pub statesync_target: u64,
+    // New metrics
+    pub uptime_us: u64,
+    pub latency_p99_ms: u64,
+    pub pending_txs: u64,
+    pub upstream_validators: u64,
 }
 
 impl PrometheusMetrics {
@@ -23,6 +28,20 @@ impl PrometheusMetrics {
 
     pub fn is_synced(&self) -> bool {
         self.sync_percentage() >= 99.99
+    }
+
+    pub fn uptime_human(&self) -> String {
+        let total_secs = self.uptime_us / 1_000_000;
+        let days = total_secs / 86400;
+        let hours = (total_secs % 86400) / 3600;
+        let mins = (total_secs % 3600) / 60;
+        if days > 0 {
+            format!("{}d {}h {}m", days, hours, mins)
+        } else if hours > 0 {
+            format!("{}h {}m", hours, mins)
+        } else {
+            format!("{}m", mins)
+        }
     }
 }
 
@@ -82,6 +101,18 @@ fn parse_metrics(body: &str) -> Result<PrometheusMetrics> {
                 }
                 "monad_statesync_last_target" => {
                     metrics.statesync_target = value as u64;
+                }
+                "monad_total_uptime_us" => {
+                    metrics.uptime_us = value as u64;
+                }
+                "monad_bft_raptorcast_udp_secondary_broadcast_latency_p99_ms" => {
+                    metrics.latency_p99_ms = value as u64;
+                }
+                "monad_bft_txpool_pool_tracked_txs" => {
+                    metrics.pending_txs = value as u64;
+                }
+                "monad_peer_disc_num_upstream_validators" => {
+                    metrics.upstream_validators = value as u64;
                 }
                 _ => {}
             }

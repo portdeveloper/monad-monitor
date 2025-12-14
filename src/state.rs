@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::PrometheusMetrics;
 use crate::rpc::{Block, RpcData};
+use crate::system::SystemData;
 
 const TPS_HISTORY_SIZE: usize = 300; // 5 minutes of history (fills wide terminals)
 const SAMPLE_HISTORY_SIZE: usize = 10; // Keep last 10 samples for TPS calculation
@@ -17,6 +18,7 @@ pub struct AppState {
     // Current data
     pub metrics: PrometheusMetrics,
     pub rpc_data: RpcData,
+    pub system: SystemData,
 
     // TPS calculation
     tx_samples: VecDeque<TxSample>,
@@ -43,6 +45,7 @@ impl AppState {
         Self {
             metrics: PrometheusMetrics::default(),
             rpc_data: RpcData::default(),
+            system: SystemData::default(),
             tx_samples: VecDeque::with_capacity(SAMPLE_HISTORY_SIZE),
             tps: 0.0,
             tps_history: VecDeque::with_capacity(TPS_HISTORY_SIZE),
@@ -99,6 +102,10 @@ impl AppState {
         }
 
         self.rpc_data = rpc_data;
+    }
+
+    pub fn update_system(&mut self, system: SystemData) {
+        self.system = system;
     }
 
     fn calculate_tps(&mut self) {

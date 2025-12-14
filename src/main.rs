@@ -1,6 +1,7 @@
 mod metrics;
 mod rpc;
 mod state;
+mod system;
 mod ui;
 
 use std::io;
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -20,14 +21,18 @@ use tokio::time::interval;
 use crate::metrics::{MetricsClient, PrometheusMetrics};
 use crate::rpc::{RpcClient, RpcData};
 use crate::state::AppState;
+use crate::system::{SystemClient, SystemData};
 
 const METRICS_ENDPOINT: &str = "http://localhost:8889/metrics";
 const RPC_ENDPOINT: &str = "http://localhost:8080";
+const NETWORK: &str = "mainnet";
 const REFRESH_INTERVAL_MS: u64 = 1000;
+const SYSTEM_REFRESH_INTERVAL_MS: u64 = 5000; // System data refreshes less frequently
 
 enum DataUpdate {
     Metrics(Result<PrometheusMetrics, String>),
     Rpc(Result<RpcData, String>),
+    System(Result<SystemData, String>),
 }
 
 #[tokio::main]
@@ -64,7 +69,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     // Channel for receiving data updates from background tasks
     let (tx, mut rx) = mpsc::channel::<DataUpdate>(10);
 
-    // Spawn background data fetcher
+    // Spawn background data fetcher for metrics and RPC
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         let metrics_client = MetricsClient::new(METRICS_ENDPOINT);
@@ -86,6 +91,23 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
 
             let _ = tx_clone.send(DataUpdate::Rpc(
                 rpc_result.map_err(|e| e.to_string())
+            )).await;
+        }
+    });
+
+    // Spawn background data fetcher for system data (less frequent)
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        let system_client = SystemClient::new(NETWORK);
+        let mut refresh_interval = interval(Duration::from_millis(SYSTEM_REFRESH_INTERVAL_MS));
+
+        loop {
+            refresh_interval.tick().await;
+
+            let system_result = system_client.fetch().await;
+
+            let _ = tx_clone.send(DataUpdate::System(
+                system_result.map_err(|e| e.to_string())
             )).await;
         }
     });
@@ -120,6 +142,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     DataUpdate::Metrics(Err(e)) => state.set_error(format!("metrics: {}", e)),
                     DataUpdate::Rpc(Ok(rpc_data)) => state.update_rpc(rpc_data),
                     DataUpdate::Rpc(Err(e)) => state.set_error(format!("rpc: {}", e)),
+                    DataUpdate::System(Ok(system)) => state.update_system(system),
+                    DataUpdate::System(Err(e)) => state.set_error(format!("system: {}", e)),
                 }
             }
         }

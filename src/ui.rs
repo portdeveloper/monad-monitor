@@ -15,22 +15,24 @@ const MONAD_ACCENT: Color = Color::Rgb(180, 140, 255);
 pub fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
 
-    // Main layout: header stats, sparkline, blocks, footer
+    // Main layout: header, secondary stats, sparkline, blocks, footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(5),  // Header stats
+            Constraint::Length(5),  // Header stats (block, peers, tps, latency)
+            Constraint::Length(3),  // Secondary stats (disk, services, diff, epoch)
             Constraint::Length(5),  // TPS sparkline
-            Constraint::Min(8),     // Recent blocks
+            Constraint::Min(6),     // Recent blocks
             Constraint::Length(3),  // Footer
         ])
         .split(area);
 
     draw_header(frame, chunks[0], state);
-    draw_sparkline(frame, chunks[1], state);
-    draw_blocks(frame, chunks[2], state);
-    draw_footer(frame, chunks[3], state);
+    draw_secondary_stats(frame, chunks[1], state);
+    draw_sparkline(frame, chunks[2], state);
+    draw_blocks(frame, chunks[3], state);
+    draw_footer(frame, chunks[4], state);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -43,42 +45,50 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Three columns: Block Height | Peers | TPS
+    // Four columns: Block Height | Peers | TPS | Latency
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
         ])
         .split(inner);
 
-    // Block height
+    // Block height with block difference
     let block_num = state.block_height();
     let sync_status = state.sync_status();
-    let sync_color = if sync_status == "synced" {
+    let block_diff = state.system.block_difference(block_num);
+    let sync_color = if sync_status == "synced" && block_diff.abs() < 5 {
         Color::Green
-    } else {
+    } else if block_diff.abs() < 20 {
         Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    let diff_str = if block_diff == 0 {
+        "Δ0".to_string()
+    } else if block_diff > 0 {
+        format!("Δ-{}", block_diff)
+    } else {
+        format!("Δ+{}", block_diff.abs())
     };
 
     let block_text = vec![
-        Line::from(vec![
-            Span::styled("BLOCK HEIGHT", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![Span::styled(
+        Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
             format_number(block_num),
             Style::default().fg(Color::White).bold(),
-        )]),
+        )),
         Line::from(vec![
             Span::styled("✓ ", Style::default().fg(sync_color)),
             Span::styled(sync_status, Style::default().fg(sync_color)),
+            Span::styled(format!(" ({})", diff_str), Style::default().fg(Color::DarkGray)),
         ]),
     ];
-    frame.render_widget(
-        Paragraph::new(block_text).alignment(Alignment::Center),
-        columns[0],
-    );
+    frame.render_widget(Paragraph::new(block_text).alignment(Alignment::Center), columns[0]);
 
     // Peers
     let peer_count = state.metrics.peer_count;
@@ -90,44 +100,101 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let peer_text = vec![
-        Line::from(vec![Span::styled(
-            "PEERS",
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(vec![Span::styled(
+        Line::from(Span::styled("PEERS", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
             format!("{}", peer_count),
             Style::default().fg(Color::White).bold(),
-        )]),
+        )),
         Line::from(vec![
             Span::styled("↑ ", Style::default().fg(peer_color)),
             Span::styled(peer_health, Style::default().fg(peer_color)),
         ]),
     ];
-    frame.render_widget(
-        Paragraph::new(peer_text).alignment(Alignment::Center),
-        columns[1],
-    );
+    frame.render_widget(Paragraph::new(peer_text).alignment(Alignment::Center), columns[1]);
 
     // TPS
     let tps = state.tps;
     let tps_text = vec![
-        Line::from(vec![Span::styled(
-            "TPS",
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(vec![Span::styled(
+        Line::from(Span::styled("TPS", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
             format!("{:.0}", tps),
             Style::default().fg(MONAD_ACCENT).bold(),
-        )]),
-        Line::from(vec![Span::styled(
-            "tx/sec",
-            Style::default().fg(Color::DarkGray),
-        )]),
+        )),
+        Line::from(Span::styled("tx/sec", Style::default().fg(Color::DarkGray))),
     ];
-    frame.render_widget(
-        Paragraph::new(tps_text).alignment(Alignment::Center),
-        columns[2],
-    );
+    frame.render_widget(Paragraph::new(tps_text).alignment(Alignment::Center), columns[2]);
+
+    // Latency (p99)
+    let latency = state.metrics.latency_p99_ms;
+    let latency_color = if latency < 100 {
+        Color::Green
+    } else if latency < 500 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    let latency_text = vec![
+        Line::from(Span::styled("LATENCY", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            format!("{}ms", latency),
+            Style::default().fg(latency_color).bold(),
+        )),
+        Line::from(Span::styled("p99", Style::default().fg(Color::DarkGray))),
+    ];
+    frame.render_widget(Paragraph::new(latency_text).alignment(Alignment::Center), columns[3]);
+}
+
+fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Build stats line
+    let sys = &state.system;
+
+    // Disk usage
+    let disk_color = if sys.disk_used_pct < 50.0 {
+        Color::Green
+    } else if sys.disk_used_pct < 80.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    // Services status
+    let services_ok = sys.all_services_running();
+    let services_color = if services_ok { Color::Green } else { Color::Red };
+    let services_str = if services_ok { "✓ all" } else { "✗ down" };
+
+    // Finalized lag
+    let fin_lag = sys.finalized_lag();
+    let ver_lag = sys.verified_lag();
+    let lag_color = if fin_lag <= 3 { Color::Green } else if fin_lag <= 10 { Color::Yellow } else { Color::Red };
+
+    // History info
+    let history_str = format!("{} blocks", format_number(sys.history_count));
+
+    let stats = Line::from(vec![
+        Span::styled("DISK: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.1}%", sys.disk_used_pct), Style::default().fg(disk_color)),
+        Span::styled(format!(" ({:.0}GB)", sys.disk_used_gb), Style::default().fg(Color::DarkGray)),
+        Span::raw("  │  "),
+        Span::styled("SERVICES: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(services_str, Style::default().fg(services_color)),
+        Span::raw("  │  "),
+        Span::styled("FINALIZED: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("-{}", fin_lag), Style::default().fg(lag_color)),
+        Span::styled(format!(" (ver -{})", ver_lag), Style::default().fg(Color::DarkGray)),
+        Span::raw("  │  "),
+        Span::styled("HISTORY: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(history_str, Style::default().fg(Color::White)),
+    ]);
+
+    frame.render_widget(Paragraph::new(stats), inner);
 }
 
 fn draw_sparkline(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -147,7 +214,6 @@ fn draw_sparkline(frame: &mut Frame, area: Rect, state: &AppState) {
         let padding = available_width - raw_len;
         std::iter::repeat(0).take(padding).chain(raw_data).collect()
     } else {
-        // Take only the most recent points that fit
         raw_data.into_iter().skip(raw_len - available_width).collect()
     };
 
@@ -235,40 +301,44 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Uptime
+    let uptime = state.metrics.uptime_human();
+
+    // Pending TXs
+    let pending = state.metrics.pending_txs;
+
+    // Gas price
     let gas_gwei = state.rpc_data.gas_price_gwei;
+
+    // Client version (shortened)
     let version = if state.rpc_data.client_version.is_empty() {
         "...".to_string()
     } else {
-        state.rpc_data.client_version.clone()
+        state.rpc_data.client_version.replace("Monad/", "v")
     };
 
-    let time_since = state
-        .time_since_last_block()
-        .map(|d| format!("{:.1}s ago", d.as_secs_f64()))
-        .unwrap_or_else(|| "...".to_string());
-
-    // Show error if present
+    // Error or status
     let status = if let Some(ref err) = state.last_error {
-        Span::styled(
-            format!("⚠ {}", err),
-            Style::default().fg(Color::Red),
-        )
+        Span::styled(format!("⚠ {}", err), Style::default().fg(Color::Red))
     } else {
-        Span::styled(
-            format!("last block: {}", time_since),
-            Style::default().fg(Color::DarkGray),
-        )
+        let time_since = state
+            .time_since_last_block()
+            .map(|d| format!("{:.1}s", d.as_secs_f64()))
+            .unwrap_or_else(|| "...".to_string());
+        Span::styled(format!("last: {}", time_since), Style::default().fg(Color::DarkGray))
     };
 
     let footer = Line::from(vec![
-        Span::styled("GAS: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{:.1} gwei", gas_gwei),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled("UPTIME: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(uptime, Style::default().fg(Color::White)),
         Span::raw("  │  "),
-        Span::styled("VERSION: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(version, Style::default().fg(Color::White)),
+        Span::styled("PENDING: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{} tx", pending), Style::default().fg(Color::White)),
+        Span::raw("  │  "),
+        Span::styled("GAS: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.0}gwei", gas_gwei), Style::default().fg(Color::White)),
+        Span::raw("  │  "),
+        Span::styled(version, Style::default().fg(Color::DarkGray)),
         Span::raw("  │  "),
         status,
         Span::raw("  │  "),
