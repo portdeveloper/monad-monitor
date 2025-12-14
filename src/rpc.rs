@@ -99,10 +99,10 @@ impl RpcClient {
             }
         }
 
-        // Fetch recent blocks (last 10)
+        // Fetch recent blocks (last 30 - UI will show as many as fit)
         if data.block_number > 0 {
-            let mut blocks = Vec::with_capacity(10);
-            for i in 0..10 {
+            let mut blocks = Vec::with_capacity(30);
+            for i in 0..30 {
                 let block_num = data.block_number.saturating_sub(i);
                 if let Ok(block) = self.get_block(block_num).await {
                     blocks.push(block);

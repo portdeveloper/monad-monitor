@@ -240,16 +240,27 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let blocks = state.recent_blocks();
+    // Calculate how many rows we can show (subtract 1 for header)
+    let available_rows = inner.height.saturating_sub(1) as usize;
+
+    // Determine if we have room for full hashes (need ~100 chars width)
+    let wide_mode = inner.width >= 100;
+    let hash_width: u16 = if wide_mode { 66 } else { 16 }; // Full hash is 66 chars
+
+    let all_blocks = state.recent_blocks();
+    let blocks_to_show = &all_blocks[..all_blocks.len().min(available_rows)];
+
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let rows: Vec<Row> = blocks
+    let rows: Vec<Row> = blocks_to_show
         .iter()
         .map(|b| {
-            let hash_short = if b.hash.len() > 14 {
+            let hash_display = if wide_mode {
+                b.hash.clone()
+            } else if b.hash.len() > 14 {
                 format!("{}...{}", &b.hash[..8], &b.hash[b.hash.len() - 4..])
             } else {
                 b.hash.clone()
@@ -271,7 +282,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
             Row::new(vec![
                 format!("#{}", format_number(b.number)),
                 format!("{} txs", b.tx_count),
-                hash_short,
+                hash_display,
                 format!("{:.0}% gas", gas_pct),
                 age,
             ])
@@ -282,7 +293,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState) {
     let widths = [
         Constraint::Length(14),
         Constraint::Length(10),
-        Constraint::Length(16),
+        Constraint::Length(hash_width),
         Constraint::Length(10),
         Constraint::Length(10),
     ];
