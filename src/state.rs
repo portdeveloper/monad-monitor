@@ -16,6 +16,7 @@ pub enum Theme {
     Monad,      // Purple-heavy brand theme
     Matrix,     // Green on black hacker style
     Ocean,      // Blue tones
+    Christmas,  // Festive red and green
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +97,8 @@ impl AppState {
             Theme::Light => Theme::Monad,
             Theme::Monad => Theme::Matrix,
             Theme::Matrix => Theme::Ocean,
-            Theme::Ocean => Theme::Gray,
+            Theme::Ocean => Theme::Christmas,
+            Theme::Christmas => Theme::Gray,
         };
     }
 
@@ -107,6 +109,7 @@ impl AppState {
             Theme::Monad => "monad",
             Theme::Matrix => "matrix",
             Theme::Ocean => "ocean",
+            Theme::Christmas => "christmas",
         }
     }
 

@@ -51,6 +51,13 @@ fn get_colors(theme: Theme) -> (Color, Color, Color, Color, Color) {
             Color::Rgb(60, 140, 180),         // text_dim
             Color::Rgb(100, 200, 255),        // sparkline
         ),
+        Theme::Christmas => (
+            Color::Rgb(220, 20, 60),          // title - crimson red
+            Color::Rgb(34, 139, 34),          // label - forest green
+            Color::Rgb(255, 250, 250),        // value - snow white
+            Color::Rgb(178, 34, 34),          // text_dim - firebrick red
+            Color::Rgb(220, 20, 60),          // sparkline - crimson
+        ),
     }
 }
 
@@ -347,14 +354,30 @@ fn draw_sparkline(frame: &mut Frame, area: Rect, state: &AppState, label_color: 
 }
 
 fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState, label_color: Color, text_dim: Color) {
+    // Split area for Christmas tree if theme is active
+    let (blocks_area, tree_area) = if state.theme == Theme::Christmas && area.width > 80 {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(60), Constraint::Length(22)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
+    // Draw Christmas tree if applicable
+    if let Some(tree_rect) = tree_area {
+        draw_christmas_tree(frame, tree_rect, state, label_color);
+    }
+
     let block = Block::default()
         .title(" RECENT BLOCKS ")
         .title_style(Style::default().fg(label_color))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(label_color));
 
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = block.inner(blocks_area);
+    frame.render_widget(block, blocks_area);
 
     // Calculate how many rows we can show (subtract 1 for header)
     let available_rows = inner.height.saturating_sub(1) as usize;
@@ -431,6 +454,158 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState, label_color: Col
         .column_spacing(2);
 
     frame.render_widget(table, inner);
+}
+
+fn draw_christmas_tree(frame: &mut Frame, area: Rect, _state: &AppState, label_color: Color) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(label_color));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = inner.width as usize;
+    let height = inner.height as usize;
+
+    // Use time for animations - updates every 800ms for very subtle snow
+    let tick = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() / 800)
+        .unwrap_or(0)) as usize;
+
+    // Light colors that cycle
+    let light_colors = [
+        Color::Rgb(255, 0, 0),      // Red
+        Color::Rgb(255, 215, 0),    // Gold
+        Color::Rgb(0, 191, 255),    // Blue
+        Color::Rgb(50, 205, 50),    // Lime green
+        Color::Rgb(255, 105, 180),  // Pink
+    ];
+
+    let tree_green = Color::Rgb(34, 139, 34);
+    let star_color = Color::Rgb(255, 215, 0);
+    let trunk_color = Color::Rgb(139, 69, 19);
+    let snow_color = Color::Rgb(200, 220, 255);
+    let text_color = Color::Rgb(255, 250, 250);
+
+    // Tree pattern (will be centered)
+    let tree_pattern = [
+        "    .*.    ",
+        "    /\\    ",
+        "   /o \\   ",
+        "  / o  \\  ",
+        " /o   o \\ ",
+        "/  o o  o\\",
+        "   |  |   ",
+        "   |__|   ",
+    ];
+
+    let tree_width = tree_pattern[0].len();
+    let tree_height_rows = tree_pattern.len();
+
+    // Position tree at bottom center
+    let tree_start_row = height.saturating_sub(tree_height_rows);
+    let tree_start_col = width.saturating_sub(tree_width) / 2;
+
+    // Greeting text
+    let greeting = "Merry Christmas";
+    let greeting_col = width.saturating_sub(greeting.len()) / 2;
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut light_idx = tick;
+
+    for row in 0..height {
+        let mut spans: Vec<Span> = Vec::new();
+
+        for col in 0..width {
+            // Check if we're in the tree area
+            let in_tree_area = row >= tree_start_row
+                && col >= tree_start_col
+                && col < tree_start_col + tree_width;
+
+            if row == 0 && col >= greeting_col && col < greeting_col + greeting.len() {
+                // Greeting text at top
+                let char_idx = col - greeting_col;
+                let ch = greeting.chars().nth(char_idx).unwrap_or(' ');
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(text_color).bold(),
+                ));
+            } else if in_tree_area {
+                // Draw tree
+                let tree_row = row - tree_start_row;
+                let tree_col = col - tree_start_col;
+                let ch = tree_pattern[tree_row].chars().nth(tree_col).unwrap_or(' ');
+
+                let span = match ch {
+                    '.' | '*' => Span::styled(ch.to_string(), Style::default().fg(star_color).bold()),
+                    'o' => {
+                        let color = light_colors[light_idx % light_colors.len()];
+                        light_idx += 1;
+                        Span::styled("o", Style::default().fg(color).bold())
+                    }
+                    '/' | '\\' => Span::styled(ch.to_string(), Style::default().fg(tree_green)),
+                    '|' | '_' => Span::styled(ch.to_string(), Style::default().fg(trunk_color)),
+                    _ => {
+                        // Snow can fall in empty tree spaces too
+                        if is_snowflake(row, col, tick, height) {
+                            Span::styled(get_snowflake(row, col, tick), Style::default().fg(snow_color))
+                        } else {
+                            Span::raw(" ")
+                        }
+                    }
+                };
+                spans.push(span);
+            } else {
+                // Background with falling snow
+                if is_snowflake(row, col, tick, height) {
+                    spans.push(Span::styled(
+                        get_snowflake(row, col, tick),
+                        Style::default().fg(snow_color),
+                    ));
+                } else {
+                    spans.push(Span::raw(" "));
+                }
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let widget = Paragraph::new(lines);
+    frame.render_widget(widget, inner);
+}
+
+// Determine if a snowflake should appear at this position
+fn is_snowflake(row: usize, col: usize, tick: usize, height: usize) -> bool {
+    if height == 0 {
+        return false;
+    }
+
+    // Each column can have a few snowflakes falling at different speeds/offsets
+    // A snowflake's current row = (start_offset + tick) % height
+
+    // Snowflake stream 1: every 5th column, slow fall
+    let has_flake_1 = (col * 7 + 3) % 11 < 2;  // ~18% of columns
+    let flake_1_row = (tick + col * 3) % height;
+
+    // Snowflake stream 2: different columns, slightly offset
+    let has_flake_2 = (col * 13 + 7) % 17 < 2;  // ~12% of columns
+    let flake_2_row = (tick + col * 5 + height / 2) % height;
+
+    // Snowflake stream 3: sparse, different timing
+    let has_flake_3 = (col * 11 + 2) % 23 < 2;  // ~9% of columns
+    let flake_3_row = (tick + col * 7 + height / 3) % height;
+
+    (has_flake_1 && row == flake_1_row)
+        || (has_flake_2 && row == flake_2_row)
+        || (has_flake_3 && row == flake_3_row)
+}
+
+// Get snowflake character with some variety
+fn get_snowflake(row: usize, col: usize, tick: usize) -> String {
+    let flakes = ['*', '.', '+', '`', '.', '*'];
+    let idx = (row + col + tick) % flakes.len();
+    flakes[idx].to_string()
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState, label_color: Color, value_color: Color) {
