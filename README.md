@@ -43,7 +43,9 @@ monad-monitor
 
 Your Monad node must expose:
 - **Prometheus metrics** on `http://localhost:8889/metrics`
-- **JSON-RPC endpoint** on `http://localhost:8080`
+- **WebSocket endpoint** on `ws://localhost:8080` (used for real-time block subscriptions)
+
+> **Note:** WebSocket support must be enabled on your node. See the [Monad Events and WebSockets documentation](https://docs.monad.xyz/node-ops/events-and-websockets) for setup instructions.
 
 ### Keyboard Controls
 
