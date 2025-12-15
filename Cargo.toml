@@ -1,6 +1,6 @@
 [package]
 name = "monad-monitor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A lightweight TUI monitor for Monad nodes"
 license = "MIT"
@@ -14,8 +14,11 @@ categories = ["command-line-utilities", "visualization"]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
-# HTTP client
+# HTTP client (for metrics endpoint)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# WebSocket client (for RPC)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 # JSON handling
 serde = { version = "1", features = ["derive"] }

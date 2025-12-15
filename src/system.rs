@@ -1,8 +1,9 @@
-use anyhow::Result;
-use reqwest::Client;
+use anyhow::{Context, Result};
+use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use std::fs;
 use std::process::Command;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Data from system commands (monad-mpt, systemctl, external RPC)
 #[derive(Debug, Clone, Default)]
@@ -90,14 +91,12 @@ impl SystemData {
 }
 
 pub struct SystemClient {
-    http_client: Client,
     network: String,
 }
 
 impl SystemClient {
     pub fn new(network: &str) -> Self {
         Self {
-            http_client: Client::new(),
             network: network.to_string(),
         }
     }
@@ -149,24 +148,39 @@ impl SystemClient {
     }
 
     async fn fetch_external_block(&self) -> Result<u64> {
-        let url = format!("https://rpc-{}.monadinfra.com", self.network);
-        let response = self
-            .http_client
-            .post(&url)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "method": "eth_blockNumber",
-                "params": [],
-                "id": 1
-            }))
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
+        let url = format!("wss://rpc-{}.monadinfra.com", self.network);
+        let (ws_stream, _) = connect_async(&url)
+            .await
+            .context("Failed to connect to external WebSocket")?;
 
-        if let Some(hex) = response["result"].as_str() {
-            let hex = hex.trim_start_matches("0x");
-            return Ok(u64::from_str_radix(hex, 16).unwrap_or(0));
+        let (mut write, mut read) = ws_stream.split();
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_blockNumber",
+            "params": [],
+            "id": 1
+        });
+
+        write
+            .send(Message::Text(request.to_string()))
+            .await
+            .context("Failed to send WebSocket message")?;
+
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    let response: serde_json::Value = serde_json::from_str(&text)?;
+                    if let Some(hex) = response["result"].as_str() {
+                        let hex = hex.trim_start_matches("0x");
+                        return Ok(u64::from_str_radix(hex, 16).unwrap_or(0));
+                    }
+                    return Ok(0);
+                }
+                Ok(Message::Close(_)) => break,
+                Err(_) => break,
+                _ => continue,
+            }
         }
         Ok(0)
     }
