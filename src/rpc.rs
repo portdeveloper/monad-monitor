@@ -204,12 +204,13 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<
                                 }
 
                                 // Fetch full block to get tx count
+                                // Use block number as request id to match response to correct block
                                 let hex_num = format!("0x{:x}", number);
                                 let block_req = JsonRpcRequest {
                                     jsonrpc: "2.0",
                                     method: "eth_getBlockByNumber".to_string(),
                                     params: json!([hex_num, false]),
-                                    id: 1000,
+                                    id: (number % 100000) as u32 + 10000,
                                 };
                                 write.send(Message::Text(serde_json::to_string(&block_req)?)).await?;
 
@@ -228,13 +229,15 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<
                         }
                     } else if let (Some(id), Some(result)) = (resp.id, resp.result) {
                         // Handle response to our requests
-                        if id == 1000 {
-                            // Block details response - update tx count
+                        if id >= 10000 && id < 110000 {
+                            // Block details response - update tx count for matching block
+                            let block_num_suffix = (id - 10000) as u64;
                             let tx_count = result["transactions"]
                                 .as_array()
                                 .map(|arr| arr.len())
                                 .unwrap_or(0);
-                            if let Some(block) = data.recent_blocks.first_mut() {
+                            // Find the block with matching number suffix
+                            if let Some(block) = data.recent_blocks.iter_mut().find(|b| b.number % 100000 == block_num_suffix) {
                                 block.tx_count = tx_count;
                             }
                             let _ = tx.send(data.clone()).await;
