@@ -6,6 +6,8 @@ A lightweight terminal UI (TUI) for real-time monitoring of Monad blockchain nod
 [![Crates.io](https://img.shields.io/crates/v/monad-monitor)](https://crates.io/crates/monad-monitor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+> ⚠️ **Disclaimer:** This software is provided "as-is" without warranty of any kind. It has not been audited for security vulnerabilities. Use at your own risk. The authors assume no liability for any damages arising from the use of this software.
+
 ## Features
 
 - **Real-time metrics** - Block height, TPS, peer count, network latency
