@@ -594,12 +594,15 @@ fn draw_christmas_tree(frame: &mut Frame, area: Rect, _state: &AppState, label_c
                 && col < tree_start_col + tree_width;
 
             if row == 0 && col >= greeting_col && col < greeting_col + greeting.len() {
-                // Greeting text at top
+                // Greeting text at top with alternating festive colors
                 let char_idx = col - greeting_col;
                 let ch = greeting.chars().nth(char_idx).unwrap_or(' ');
+                let festive_red = Color::Rgb(255, 50, 50);
+                let festive_green = Color::Rgb(50, 205, 50);
+                let color = if char_idx % 2 == 0 { festive_red } else { festive_green };
                 spans.push(Span::styled(
                     ch.to_string(),
-                    Style::default().fg(text_color).bold(),
+                    Style::default().fg(color).bold(),
                 ));
             } else if in_tree_area {
                 // Draw tree
