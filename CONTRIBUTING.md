@@ -1,5 +1,12 @@
 # Contributing to monad-monitor
 
+## How work lands
+
+All changes go through a pull request, and every pull request needs an approving
+review from @portdeveloper before it can merge. Direct pushes to the default
+branch are turned off. A merge means the work was read and accepted, not just
+that it was opened.
+
 Thank you for your interest in contributing to monad-monitor - a lightweight terminal UI for real-time monitoring of Monad blockchain nodes.
 
 ## About the project
