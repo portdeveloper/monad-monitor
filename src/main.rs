@@ -1,3 +1,4 @@
+mod config;
 mod metrics;
 mod rpc;
 mod state;
@@ -18,15 +19,12 @@ use ratatui::prelude::*;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use crate::config::Config;
 use crate::metrics::{MetricsClient, PrometheusMetrics};
 use crate::rpc::{RpcClient, RpcData};
 use crate::state::AppState;
 use crate::system::{SystemClient, SystemData};
 
-const METRICS_ENDPOINT: &str = "http://localhost:8889/metrics";
-const RPC_ENDPOINT: &str = "ws://localhost:8081";
-const NETWORK: &str = "mainnet";
-const METRICS_REFRESH_INTERVAL_MS: u64 = 1000;
 const SYSTEM_REFRESH_INTERVAL_MS: u64 = 5000;
 
 enum DataUpdate {
@@ -37,6 +35,11 @@ enum DataUpdate {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cfg = Config::load().unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    });
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -45,7 +48,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run app
-    let result = run_app(&mut terminal).await;
+    let result = run_app(&mut terminal, cfg).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -63,7 +66,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, cfg: Config) -> Result<()> {
     let mut state = AppState::new();
 
     // Channel for receiving data updates from background tasks
@@ -71,7 +74,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
 
     // Spawn RPC subscription (real-time block updates)
     let (rpc_tx, mut rpc_rx) = mpsc::channel::<RpcData>(100);
-    let rpc_client = RpcClient::new(RPC_ENDPOINT);
+    let rpc_client = RpcClient::new(&cfg.ws_url);
     rpc_client.subscribe(rpc_tx);
 
     // Forward RPC updates to main channel
@@ -84,31 +87,33 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
 
     // Spawn background data fetcher for metrics (polling)
     let tx_metrics = tx.clone();
+    let metrics_url = cfg.metrics_url.clone();
+    let metrics_interval_ms = cfg.refresh_secs * 1000;
     tokio::spawn(async move {
-        let metrics_client = MetricsClient::new(METRICS_ENDPOINT);
-        let mut refresh_interval = interval(Duration::from_millis(METRICS_REFRESH_INTERVAL_MS));
+        let metrics_client = MetricsClient::new(&metrics_url);
+        let mut refresh_interval = interval(Duration::from_millis(metrics_interval_ms));
 
         loop {
             refresh_interval.tick().await;
-            let metrics_result = metrics_client.fetch().await;
-            let _ = tx_metrics.send(DataUpdate::Metrics(
-                metrics_result.map_err(|e| e.to_string())
-            )).await;
+            let result = metrics_client.fetch().await;
+            let update = result.map_err(|e| format!("{} ({})", e, metrics_client.endpoint()));
+            let _ = tx_metrics.send(DataUpdate::Metrics(update)).await;
         }
     });
 
     // Spawn background data fetcher for system data (less frequent)
     let tx_system = tx.clone();
+    let external_rpc_url = cfg.resolved_external_rpc_url();
     tokio::spawn(async move {
-        let system_client = SystemClient::new(NETWORK);
+        let system_client = SystemClient::new(&external_rpc_url);
         let mut refresh_interval = interval(Duration::from_millis(SYSTEM_REFRESH_INTERVAL_MS));
 
         loop {
             refresh_interval.tick().await;
             let system_result = system_client.fetch().await;
-            let _ = tx_system.send(DataUpdate::System(
-                system_result.map_err(|e| e.to_string())
-            )).await;
+            let _ = tx_system
+                .send(DataUpdate::System(system_result.map_err(|e| e.to_string())))
+                .await;
         }
     });
 

@@ -41,11 +41,41 @@ Run on a machine with a Monad node:
 monad-monitor
 ```
 
+Or point it at a remote node:
+
+```bash
+monad-monitor --metrics-url http://node:8889/metrics --ws-url ws://node:8081
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--metrics-url <URL>` | `http://localhost:8889/metrics` | Prometheus metrics endpoint |
+| `--ws-url <URL>` | `ws://localhost:8081` | Local node WebSocket endpoint |
+| `--refresh <seconds>` | `1` | Metrics polling interval |
+| `--network <name>` | `mainnet` | Network for external block comparison (`wss://rpc-<name>.monadinfra.com`) |
+| `--external-rpc-url <URL>` | — | Override the external RPC URL directly; takes precedence over `--network` |
+| `-h`, `--help` | — | Print help |
+
+### Config file
+
+You can also set defaults in `~/.config/monad-monitor/config.toml`
+(or `$XDG_CONFIG_HOME/monad-monitor/config.toml`). CLI flags take precedence.
+
+```toml
+metrics_url = "http://node:8889/metrics"
+ws_url = "ws://node:8081"
+refresh = 5
+network = "testnet"
+# external_rpc_url = "wss://my-rpc.example.com"
+```
+
 ### Requirements
 
 Your Monad node must expose:
 - **Prometheus metrics** on `http://localhost:8889/metrics`
-- **WebSocket endpoint** on `ws://localhost:8080` (used for real-time block subscriptions)
+- **WebSocket endpoint** on `ws://localhost:8081` (used for real-time block subscriptions)
 
 > **Note:** WebSocket support must be enabled on your node. See the [Monad Events and WebSockets documentation](https://docs.monad.xyz/node-ops/events-and-websockets) for setup instructions.
 

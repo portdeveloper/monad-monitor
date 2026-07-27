@@ -91,13 +91,13 @@ impl SystemData {
 }
 
 pub struct SystemClient {
-    network: String,
+    external_rpc_url: String,
 }
 
 impl SystemClient {
-    pub fn new(network: &str) -> Self {
+    pub fn new(external_rpc_url: &str) -> Self {
         Self {
-            network: network.to_string(),
+            external_rpc_url: external_rpc_url.to_string(),
         }
     }
 
@@ -148,8 +148,8 @@ impl SystemClient {
     }
 
     async fn fetch_external_block(&self) -> Result<u64> {
-        let url = format!("wss://rpc-{}.monadinfra.com", self.network);
-        let (ws_stream, _) = connect_async(&url)
+        let url = &self.external_rpc_url;
+        let (ws_stream, _) = connect_async(url)
             .await
             .context("Failed to connect to external WebSocket")?;
 
@@ -299,9 +299,17 @@ fn fetch_system_resources() -> (f64, f64, f64, f64, u64, u64) {
 
         for line in meminfo.lines() {
             if line.starts_with("MemTotal:") {
-                total_kb = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                total_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
             } else if line.starts_with("MemAvailable:") {
-                available_kb = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                available_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
             }
         }
 

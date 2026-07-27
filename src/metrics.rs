@@ -44,6 +44,10 @@ impl MetricsClient {
         }
     }
 
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub async fn fetch(&self) -> Result<PrometheusMetrics> {
         let body = self
             .client
