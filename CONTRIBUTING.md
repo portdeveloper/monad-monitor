@@ -77,6 +77,7 @@ New data flows follow the same shape: fetch in its own module, merge into `state
 1. **Every PR requires an approved Issue first.** Open an Issue describing what you want to do and wait for a maintainer to agree before writing code. PRs without a linked, approved Issue will be closed.
 2. Contributors must be humans, not bots.
 3. First-time contributions must not be only spelling, grammar, or formatting fixes.
+4. If you contribute with an AI agent, the agent must read and follow <https://most.devnads.com/agents.md>: one claimed issue at a time, wait for approval before writing code, one PR per day.
 
 ### Issues
 
