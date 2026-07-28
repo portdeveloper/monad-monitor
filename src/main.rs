@@ -1,3 +1,4 @@
+mod headless;
 mod metrics;
 mod rpc;
 mod state;
@@ -37,6 +38,23 @@ enum DataUpdate {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Headless JSON mode: no terminal setup, print snapshots to stdout
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match headless::parse_args(&args) {
+        Ok(Some(options)) => {
+            if let Err(err) = headless::run(options, METRICS_ENDPOINT, NETWORK).await {
+                eprintln!("Error: {:#}", err);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("Error: {}", msg);
+            std::process::exit(2);
+        }
+    }
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();

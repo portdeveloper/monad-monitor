@@ -56,6 +56,33 @@ Your Monad node must expose:
 | `q` / `Q` / `Esc` | Quit |
 | `t` / `T` | Cycle through themes |
 
+## Headless JSON mode
+
+For scripts, cron checks and exporters, `--json` prints one snapshot as a
+single JSON object on stdout and exits without starting the TUI:
+
+```bash
+monad-monitor --json | jq .block_height
+```
+
+The object carries the headline numbers at the top level (`block_height`,
+`peer_count`, `tps`, `latency_p99_ms`, `sync_pct`, `finalized_lag`,
+`cpu_usage_pct`, `memory_used_pct`, `disk_used_pct`, `services`, `timestamp`)
+plus the full parsed metrics and system structs under `metrics` and `system`.
+
+`--json --watch <secs>` streams one object per interval as NDJSON:
+
+```bash
+monad-monitor --json --watch 5 | while read -r line; do
+  echo "$line" | jq .tps
+done
+```
+
+The exit code is nonzero when the metrics endpoint is unreachable, so shell
+scripts can alert on it. In watch mode the stream keeps going when the node
+goes down; those lines have null metrics fields and an `error` string while
+the host stats stay populated.
+
 ## Display
 
 ```
