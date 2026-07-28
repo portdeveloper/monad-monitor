@@ -41,6 +41,61 @@ Run on a machine with a Monad node:
 monad-monitor
 ```
 
+### Alerts
+
+All thresholds are off by default. Enable any of them with flags:
+
+```bash
+monad-monitor \
+  --alert-block-stall 30 \
+  --alert-finalized-lag 10 \
+  --alert-min-peers 5 \
+  --alert-disk-pct 90 \
+  --webhook-url https://discord.com/api/webhooks/...
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--alert-block-stall <secs>` | Alert when no new block for this many seconds |
+| `--alert-finalized-lag <blocks>` | Alert when finalized lag exceeds this many blocks |
+| `--alert-min-peers <n>` | Alert when peer count drops below this |
+| `--alert-disk-pct <pct>` | Alert when disk usage exceeds this percentage |
+| `--webhook-url <url>` | POST a JSON payload here on every alert transition |
+
+The same settings can live in `~/.config/monad-monitor/config.toml`
+(or `$XDG_CONFIG_HOME/monad-monitor/config.toml`); flags take precedence:
+
+```toml
+alert_block_stall = 30
+alert_finalized_lag = 10
+alert_min_peers = 5
+alert_disk_pct = 90
+webhook_url = "https://discord.com/api/webhooks/..."
+```
+
+Alerts fire on state transitions only: one webhook POST when a threshold
+trips and one when it recovers, not one per refresh tick. While an alert is
+firing the affected cell in the TUI turns red. The payload is generic JSON
+with a human-readable `text` field (duplicated as `content`), so pointing
+`--webhook-url` directly at a Discord or Slack incoming webhook renders a
+readable message:
+
+```json
+{
+  "alert": "block_stall",
+  "state": "firing",
+  "value": 45.2,
+  "threshold": 30,
+  "node": "my-node",
+  "timestamp": 1753670000,
+  "text": "[monad-monitor] block_stall firing on my-node: no new block for 45.2s (threshold 30s)",
+  "content": "[monad-monitor] block_stall firing on my-node: no new block for 45.2s (threshold 30s)"
+}
+```
+
+Alerting stays read-only: it observes and notifies, nothing more. A failed
+webhook delivery shows up in the footer and never interrupts monitoring.
+
 ### Requirements
 
 Your Monad node must expose:

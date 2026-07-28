@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::alerts::ActiveAlerts;
 use crate::metrics::PrometheusMetrics;
 use crate::rpc::{Block, RpcData};
 use crate::system::SystemData;
@@ -56,6 +57,9 @@ pub struct AppState {
     // Error tracking
     pub last_error: Option<String>,
 
+    // Alerts currently firing (updated by the alert engine)
+    pub active_alerts: ActiveAlerts,
+
     // UI theme
     pub theme: Theme,
 }
@@ -87,6 +91,7 @@ impl AppState {
             net_rx_rate: 0.0,
             net_tx_rate: 0.0,
             last_error: None,
+            active_alerts: ActiveAlerts::default(),
             theme: Theme::Gray,
         }
     }

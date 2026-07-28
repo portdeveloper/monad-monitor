@@ -226,11 +226,18 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
         format!("Δ+{}", block_diff.abs())
     };
 
+    // Block stall alert: the cell turns to the alert color while tripped
+    let block_value_color = if state.active_alerts.block_stall {
+        Color::Red
+    } else {
+        value_color
+    };
+
     let block_text = vec![
         Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(label_color))),
         Line::from(Span::styled(
             format_number(block_num),
-            Style::default().fg(value_color).bold(),
+            Style::default().fg(block_value_color).bold(),
         )),
         Line::from(vec![
             Span::styled("✓ ", Style::default().fg(sync_color)),
@@ -256,10 +263,17 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
         _ => ("", label_color),
     };
 
+    // Min peers alert: the cell turns to the alert color while tripped
+    let peer_value_color = if state.active_alerts.min_peers {
+        Color::Red
+    } else {
+        value_color
+    };
+
     let peer_text = vec![
         Line::from(Span::styled("PEERS", Style::default().fg(label_color))),
         Line::from(vec![
-            Span::styled(format!("{}", peer_count), Style::default().fg(value_color).bold()),
+            Span::styled(format!("{}", peer_count), Style::default().fg(peer_value_color).bold()),
             Span::styled(format!(" {}", peer_trend_arrow), Style::default().fg(peer_trend_color)),
         ]),
         Line::from(vec![
@@ -349,7 +363,10 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
     };
 
     // Disk usage
-    let disk_color = if sys.disk_used_pct < 50.0 {
+    let disk_color = if state.active_alerts.disk_pct {
+        // Disk alert tripped: the cell holds the alert color
+        Color::Red
+    } else if sys.disk_used_pct < 50.0 {
         Color::Green
     } else if sys.disk_used_pct < 80.0 {
         Color::Yellow
@@ -368,7 +385,16 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
 
     // Finalized lag
     let fin_lag = sys.finalized_lag();
-    let lag_color = if fin_lag <= 3 { Color::Green } else if fin_lag <= 10 { Color::Yellow } else { Color::Red };
+    let lag_color = if state.active_alerts.finalized_lag {
+        // Finalized lag alert tripped: the cell holds the alert color
+        Color::Red
+    } else if fin_lag <= 3 {
+        Color::Green
+    } else if fin_lag <= 10 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
 
     let stats = Line::from(vec![
         Span::styled("CPU: ", Style::default().fg(label_color)),

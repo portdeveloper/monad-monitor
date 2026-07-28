@@ -1,3 +1,4 @@
+mod alerts;
 mod metrics;
 mod rpc;
 mod state;
@@ -18,6 +19,7 @@ use ratatui::prelude::*;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use crate::alerts::{AlertConfig, AlertEngine, AlertSample};
 use crate::metrics::{MetricsClient, PrometheusMetrics};
 use crate::rpc::{RpcClient, RpcData};
 use crate::state::AppState;
@@ -33,10 +35,20 @@ enum DataUpdate {
     Metrics(Result<PrometheusMetrics, String>),
     Rpc(RpcData),
     System(Result<SystemData, String>),
+    WebhookError(String),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse alert settings before touching the terminal so errors print cleanly
+    let alert_config = match AlertConfig::load() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("Error: {}", err);
+            std::process::exit(2);
+        }
+    };
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -45,7 +57,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run app
-    let result = run_app(&mut terminal).await;
+    let result = run_app(&mut terminal, alert_config).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -63,8 +75,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, alert_config: AlertConfig) -> Result<()> {
     let mut state = AppState::new();
+
+    // Alert engine and a client for webhook deliveries
+    let mut alert_engine = AlertEngine::new(alert_config);
+    let webhook_client = reqwest::Client::new();
+
+    // Alerts only look at data that has actually arrived, never at defaults
+    let mut have_metrics = false;
+    let mut have_system = false;
 
     // Channel for receiving data updates from background tasks
     let (tx, mut rx) = mpsc::channel::<DataUpdate>(100);
@@ -144,11 +164,18 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
             // Handle data updates from background tasks
             Some(update) = rx.recv() => {
                 match update {
-                    DataUpdate::Metrics(Ok(metrics)) => state.update_metrics(metrics),
+                    DataUpdate::Metrics(Ok(metrics)) => {
+                        state.update_metrics(metrics);
+                        have_metrics = true;
+                    }
                     DataUpdate::Metrics(Err(e)) => state.set_error(format!("metrics: {}", e)),
                     DataUpdate::Rpc(rpc_data) => state.update_rpc(rpc_data),
-                    DataUpdate::System(Ok(system)) => state.update_system(system),
+                    DataUpdate::System(Ok(system)) => {
+                        state.update_system(system);
+                        have_system = true;
+                    }
                     DataUpdate::System(Err(e)) => state.set_error(format!("system: {}", e)),
+                    DataUpdate::WebhookError(e) => state.set_error(format!("webhook: {}", e)),
                 }
             }
 
@@ -156,6 +183,38 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
             _ = ui_ticker.tick() => {
                 // Just triggers a redraw
             }
+        }
+
+        // Check alert thresholds after every event so the block stall timer is
+        // watched even when no new data arrives. Transitions only: the engine
+        // reports one event when a threshold trips and one when it recovers.
+        if alert_engine.enabled() {
+            let sample = AlertSample {
+                secs_since_last_block: state.time_since_last_block().map(|d| d.as_secs_f64()),
+                finalized_lag: have_system.then(|| state.system.finalized_lag()),
+                peer_count: have_metrics.then_some(state.metrics.peer_count),
+                disk_used_pct: have_system.then_some(state.system.disk_used_pct),
+            };
+            for event in alert_engine.evaluate(&sample) {
+                if let Some(url) = alert_engine.webhook_url() {
+                    let client = webhook_client.clone();
+                    let url = url.to_string();
+                    let node = if state.system.node_id.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        state.system.node_id.clone()
+                    };
+                    let tx_hook = tx.clone();
+                    // Deliver in the background; a slow or dead webhook must
+                    // never stall the UI. Failures surface in the footer.
+                    tokio::spawn(async move {
+                        if let Err(e) = alerts::post_webhook(&client, &url, &event, &node).await {
+                            let _ = tx_hook.send(DataUpdate::WebhookError(e)).await;
+                        }
+                    });
+                }
+            }
+            state.active_alerts = alert_engine.active();
         }
     }
 }
