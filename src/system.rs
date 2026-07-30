@@ -355,54 +355,69 @@ fn fetch_system_resources() -> (f64, f64, f64, f64, u64, u64) {
     (mem_pct, mem_used_gb, mem_total_gb, cpu_pct, net_rx, net_tx)
 }
 
+fn is_size_unit(s: &str) -> bool {
+    matches!(s, "Tb" | "Gb" | "Mb" | "Kb")
+}
+
+fn size_to_gb(value: f64, unit: &str) -> f64 {
+    match unit {
+        "Tb" => value * 1024.0,
+        "Mb" => value / 1024.0,
+        "Kb" => value / (1024.0 * 1024.0),
+        _ => value, // Gb, or an unrecognised unit left as-is
+    }
+}
+
+fn trim_num(s: &str) -> &str {
+    s.trim_end_matches([',', '.'])
+}
+
 fn parse_mpt_output(output: &str, data: &mut SystemData) {
     for line in output.lines() {
         let line = line.trim();
 
-        // Parse disk capacity/used line: "1.75 Tb      109.30 Gb  6.11%"
-        if line.contains("Tb") && line.contains("Gb") && line.contains('%') {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 5 {
-                // Capacity
-                if let Ok(cap) = parts[0].parse::<f64>() {
-                    let unit = parts[1];
-                    data.disk_capacity_gb = match unit {
-                        "Tb" => cap * 1024.0,
-                        "Gb" => cap,
-                        _ => cap,
-                    };
-                }
-                // Used
-                if let Ok(used) = parts[2].parse::<f64>() {
-                    let unit = parts[3];
-                    data.disk_used_gb = match unit {
-                        "Tb" => used * 1024.0,
-                        "Gb" => used,
-                        "Mb" => used / 1024.0,
-                        _ => used,
-                    };
-                }
-                // Percentage
-                if let Ok(pct) = parts[4].trim_end_matches('%').parse::<f64>() {
-                    data.disk_used_pct = pct;
-                }
+        // Parse disk capacity/used line. Capacity and used each carry their own
+        // unit, and the used unit grows with size:
+        //   "1.75 Tb   109.30 Gb   6.11%   /dev/..."   (used below 1 Tb)
+        //   "1.82 Tb     1.10 Tb  60.21%   /dev/..."   (used at or above 1 Tb)
+        // Match on the column shape (num unit num unit pct%) so a used value in
+        // Tb parses too, rather than requiring a "Gb" somewhere on the line.
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 5
+            && is_size_unit(parts[1])
+            && is_size_unit(parts[3])
+            && parts[4].ends_with('%')
+        {
+            if let Ok(cap) = parts[0].parse::<f64>() {
+                data.disk_capacity_gb = size_to_gb(cap, parts[1]);
+            }
+            if let Ok(used) = parts[2].parse::<f64>() {
+                data.disk_used_gb = size_to_gb(used, parts[3]);
+            }
+            if let Ok(pct) = parts[4].trim_end_matches('%').parse::<f64>() {
+                data.disk_used_pct = pct;
             }
         }
 
-        // Parse history line: "MPT database has 637751 history, earliest is 41295350 latest is 41933100."
-        if line.contains("MPT database has") && line.contains("history") {
+        // Parse history line. Older clients print it on the summary line, newer
+        // ones print it under the timeline:
+        //   old: "MPT database has 637751 history, earliest is 41295350 latest is 41933100."
+        //   new: "History: 7973666 versions, earliest is 41193452, latest is 49167117"
+        // Both spell out "earliest is X" and "latest is Y"; the count follows
+        // "has" or "History:". Numbers may carry a trailing comma or period.
+        let is_history_line = (line.contains("MPT database has") && line.contains("history"))
+            || line.starts_with("History:");
+        if is_history_line {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for (i, part) in parts.iter().enumerate() {
-                if *part == "has" && i + 1 < parts.len() {
-                    data.history_count = parts[i + 1].parse().unwrap_or(0);
+                if (*part == "has" || *part == "History:") && i + 1 < parts.len() {
+                    data.history_count = trim_num(parts[i + 1]).parse().unwrap_or(0);
                 }
                 if *part == "earliest" && i + 2 < parts.len() {
-                    data.history_earliest = parts[i + 2].parse().unwrap_or(0);
+                    data.history_earliest = trim_num(parts[i + 2]).parse().unwrap_or(0);
                 }
                 if *part == "latest" && i + 2 < parts.len() {
-                    // Remove trailing period
-                    let val = parts[i + 2].trim_end_matches('.');
-                    data.history_latest = val.parse().unwrap_or(0);
+                    data.history_latest = trim_num(parts[i + 2]).parse().unwrap_or(0);
                 }
             }
         }
@@ -421,5 +436,65 @@ fn parse_mpt_output(output: &str, data: &mut SystemData) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_line_used_in_terabytes() {
+        // Once used passes 1 Tb the used column is also Tb; the old guard needed
+        // a "Gb" on the line, missed this, and left the disk read at 0%.
+        let out = "           1.75 Tb        1.31 Tb 75.24%  \"/dev/nvme2n1p1\"";
+        let mut data = SystemData::default();
+        parse_mpt_output(out, &mut data);
+        assert_eq!(data.disk_used_pct, 75.24);
+        assert!((data.disk_capacity_gb - 1.75 * 1024.0).abs() < 1e-6);
+        assert!((data.disk_used_gb - 1.31 * 1024.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn disk_line_used_in_gigabytes() {
+        let out = "           1.75 Tb      109.30 Gb  6.11%  \"/dev/nvme2n1p1\"";
+        let mut data = SystemData::default();
+        parse_mpt_output(out, &mut data);
+        assert_eq!(data.disk_used_pct, 6.11);
+        assert!((data.disk_capacity_gb - 1.75 * 1024.0).abs() < 1e-6);
+        assert!((data.disk_used_gb - 109.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn history_versions_line() {
+        // Current clients print history under the timeline as "History: ...".
+        let out = "        History: 7973666 versions, earliest is 41193452, latest is 49167117";
+        let mut data = SystemData::default();
+        parse_mpt_output(out, &mut data);
+        assert_eq!(data.history_count, 7973666);
+        assert_eq!(data.history_earliest, 41193452);
+        assert_eq!(data.history_latest, 49167117);
+    }
+
+    #[test]
+    fn history_legacy_line() {
+        let out = "MPT database has 637751 history, earliest is 41295350 latest is 41933100.";
+        let mut data = SystemData::default();
+        parse_mpt_output(out, &mut data);
+        assert_eq!(data.history_count, 637751);
+        assert_eq!(data.history_earliest, 41295350);
+        assert_eq!(data.history_latest, 41933100);
+    }
+
+    #[test]
+    fn finalized_lag_recovers_with_history_line() {
+        // With the "History:" line parsed, finalized_lag stops reading a flat 0.
+        let out = "        History: 100 versions, earliest is 1, latest is 500\n     \
+                   Latest finalized is 498, latest verified is 495";
+        let mut data = SystemData::default();
+        parse_mpt_output(out, &mut data);
+        assert_eq!(data.history_latest, 500);
+        assert_eq!(data.latest_finalized, 498);
+        assert_eq!(data.finalized_lag(), 2);
     }
 }
