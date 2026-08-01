@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
+use serde::Serialize;
 use serde_json::json;
 use std::fs;
 use std::process::Command;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Data from system commands (monad-mpt, systemctl, external RPC)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SystemData {
     // Disk info from monad-mpt
     pub disk_capacity_gb: f64,

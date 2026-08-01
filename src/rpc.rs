@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Block {
     pub number: u64,
     pub hash: String,
@@ -16,7 +16,7 @@ pub struct Block {
     pub gas_limit: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RpcData {
     pub block_number: u64,
     pub gas_price_gwei: f64,
@@ -71,6 +71,69 @@ impl RpcClient {
                 }
             }
         })
+    }
+
+    /// Fetch a single snapshot of RPC data (block number, gas price, client
+    /// version) and return, without subscribing. Used by the headless JSON
+    /// mode where we want one reading rather than a live stream.
+    pub async fn fetch_once(&self) -> Result<RpcData> {
+        let (ws_stream, _) = connect_async(&self.endpoint)
+            .await
+            .context("Failed to connect to WebSocket")?;
+        let (mut write, mut read) = ws_stream.split();
+
+        let mut data = RpcData::default();
+        let requests = vec![
+            JsonRpcRequest {
+                jsonrpc: "2.0",
+                method: "eth_blockNumber".to_string(),
+                params: json!([]),
+                id: 0,
+            },
+            JsonRpcRequest {
+                jsonrpc: "2.0",
+                method: "eth_gasPrice".to_string(),
+                params: json!([]),
+                id: 1,
+            },
+            JsonRpcRequest {
+                jsonrpc: "2.0",
+                method: "web3_clientVersion".to_string(),
+                params: json!([]),
+                id: 2,
+            },
+        ];
+        for req in &requests {
+            write.send(Message::Text(serde_json::to_string(req)?)).await?;
+        }
+
+        let mut responses: HashMap<u32, Value> = HashMap::new();
+        while responses.len() < requests.len() {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
+                        if let (Some(id), Some(result)) = (resp.id, resp.result) {
+                            responses.insert(id, result);
+                        }
+                    }
+                }
+                // Connection closed or errored before all replies arrived: return
+                // whatever we have rather than blocking forever.
+                _ => break,
+            }
+        }
+
+        if let Some(hex) = responses.get(&0).and_then(|v| v.as_str()) {
+            data.block_number = parse_hex_u64(hex);
+        }
+        if let Some(hex) = responses.get(&1).and_then(|v| v.as_str()) {
+            data.gas_price_gwei = parse_hex_u64(hex) as f64 / 1_000_000_000.0;
+        }
+        if let Some(version) = responses.get(&2).and_then(|v| v.as_str()) {
+            data.client_version = version.to_string();
+        }
+
+        Ok(data)
     }
 }
 
