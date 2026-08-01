@@ -1,0 +1,24 @@
+# Build and test every PR and every push to main, so pool contributions get
+# checked automatically instead of a maintainer running cargo test by hand.
+# No fmt/clippy gate for now: the tree has pre-existing fmt diffs, and a gate
+# that fails on day one teaches everyone to ignore it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: cargo test --locked
