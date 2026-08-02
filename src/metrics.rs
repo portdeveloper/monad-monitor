@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::Serialize;
 
 /// Metrics fetched from Prometheus endpoint
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PrometheusMetrics {
     pub block_num: u64,
     pub tx_commits: u64,
