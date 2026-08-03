@@ -7,10 +7,25 @@ use ratatui::{
     Frame,
 };
 
+use crate::alerts::AlertKind;
 use crate::state::{AppState, Theme};
 
 // Monad brand colors
 const MONAD_PRIMARY: Color = Color::Rgb(110, 84, 255);  // #6E54FF
+
+/// A tripped threshold owns its cell's colour until it clears, so an incident
+/// is visible on the screen and not only in the webhook.
+const ALERT_COLOR: Color = Color::Rgb(255, 85, 85);
+
+/// Returns the alert colour while `kind` is tripped, and the colour the cell
+/// would normally use otherwise.
+fn alert_or(state: &AppState, kind: AlertKind, normal: Color) -> Color {
+    if state.alerts.is_tripped(kind) {
+        ALERT_COLOR
+    } else {
+        normal
+    }
+}
 
 /// Get colors based on current theme
 /// Returns (title, label, value, text_dim, sparkline)
@@ -230,7 +245,9 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
         Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(label_color))),
         Line::from(Span::styled(
             format_number(block_num),
-            Style::default().fg(value_color).bold(),
+            Style::default()
+                .fg(alert_or(state, AlertKind::NoBlock, value_color))
+                .bold(),
         )),
         Line::from(vec![
             Span::styled("✓ ", Style::default().fg(sync_color)),
@@ -259,7 +276,12 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
     let peer_text = vec![
         Line::from(Span::styled("PEERS", Style::default().fg(label_color))),
         Line::from(vec![
-            Span::styled(format!("{}", peer_count), Style::default().fg(value_color).bold()),
+            Span::styled(
+                format!("{}", peer_count),
+                Style::default()
+                    .fg(alert_or(state, AlertKind::LowPeers, value_color))
+                    .bold(),
+            ),
             Span::styled(format!(" {}", peer_trend_arrow), Style::default().fg(peer_trend_color)),
         ]),
         Line::from(vec![
@@ -356,6 +378,7 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
     } else {
         Color::Red
     };
+    let disk_color = alert_or(state, AlertKind::DiskFull, disk_color);
 
     // Services status
     let services_ok = sys.all_services_running();
@@ -369,6 +392,7 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
     // Finalized lag
     let fin_lag = sys.finalized_lag();
     let lag_color = if fin_lag <= 3 { Color::Green } else if fin_lag <= 10 { Color::Yellow } else { Color::Red };
+    let lag_color = alert_or(state, AlertKind::FinalizedLag, lag_color);
 
     let stats = Line::from(vec![
         Span::styled("CPU: ", Style::default().fg(label_color)),
@@ -702,8 +726,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState, label_color: Col
         state.rpc_data.client_version.replace("Monad/", "v")
     };
 
-    // Error or status
-    let status = if let Some(ref err) = state.last_error {
+    // Error or status. A dead block stream outranks a transient fetch error:
+    // it is the reason the numbers above stopped moving.
+    let status = if let Some(ref err) = state.webhook_error {
+        Span::styled(format!("⚠ webhook: {}", err), Style::default().fg(Color::Red))
+    } else if let Some(ref err) = state.ws_error {
+        Span::styled(format!("⚠ rpc: {}", err), Style::default().fg(Color::Red))
+    } else if let Some(ref err) = state.last_error {
         Span::styled(format!("⚠ {}", err), Style::default().fg(Color::Red))
     } else {
         let time_since = state

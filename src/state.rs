@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::alerts::{AlertState, Sample};
 use crate::metrics::PrometheusMetrics;
 use crate::rpc::{Block, RpcData};
 use crate::system::SystemData;
@@ -43,6 +44,30 @@ pub struct AppState {
     pub last_block_time: Option<Instant>,
     last_block_number: u64,
 
+    // When the node's WebSocket last delivered a block, and whether the
+    // subscription is up. Kept apart from `last_block_time`, which the metrics
+    // poll also refreshes: a dead WebSocket has to stay visible even while
+    // Prometheus keeps answering.
+    last_rpc_block_at: Option<Instant>,
+    pub ws_connected: bool,
+
+    // Why the subscription is down, kept separate from `last_error` because a
+    // successful metrics poll clears that one every second and would otherwise
+    // wipe the reason a second after it appeared.
+    pub ws_error: Option<String>,
+
+    // Why the last webhook delivery failed, if it did. Cleared by the next
+    // delivery that succeeds.
+    pub webhook_error: Option<String>,
+
+    // Whether each source has reported at least once. A threshold is not
+    // evaluated against a value nobody has measured yet.
+    metrics_seen: bool,
+    system_seen: bool,
+
+    // Which alert thresholds are currently tripped.
+    pub alerts: AlertState,
+
     // Latency tracking
     latency_prev: u64,
     peers_prev: u64,
@@ -80,6 +105,13 @@ impl AppState {
             last_update: Instant::now(),
             last_block_time: None,
             last_block_number: 0,
+            last_rpc_block_at: None,
+            ws_connected: false,
+            ws_error: None,
+            webhook_error: None,
+            metrics_seen: false,
+            system_seen: false,
+            alerts: AlertState::default(),
             latency_prev: 0,
             peers_prev: 0,
             net_rx_prev: 0,
@@ -150,6 +182,7 @@ impl AppState {
 
         self.metrics = metrics;
         self.last_update = Instant::now();
+        self.metrics_seen = true;
         self.last_error = None;
     }
 
@@ -162,7 +195,44 @@ impl AppState {
             }
         }
 
+        if rpc_data.block_number > 0 {
+            self.last_rpc_block_at = Some(Instant::now());
+        }
+        self.ws_connected = true;
         self.rpc_data = rpc_data;
+    }
+
+    /// The subscription came up.
+    pub fn set_ws_connected(&mut self) {
+        self.ws_connected = true;
+        self.ws_error = None;
+    }
+
+    /// The subscription dropped. The reason stays on screen for as long as the
+    /// stream is down rather than leaving the display frozen on stale blocks
+    /// with nothing to explain it.
+    pub fn set_ws_disconnected(&mut self, reason: String) {
+        self.ws_connected = false;
+        self.ws_error = Some(reason);
+    }
+
+    /// The result of one webhook delivery. A failure stays on screen until a
+    /// later one gets through, so a webhook that has stopped working is not
+    /// mistaken for a quiet night.
+    pub fn set_webhook_result(&mut self, result: Result<(), String>) {
+        self.webhook_error = result.err();
+    }
+
+    /// The readings the alert thresholds are evaluated against. A source that
+    /// has not reported yet is left unknown so a fresh start cannot look like
+    /// an incident.
+    pub fn alert_sample(&self) -> Sample {
+        Sample {
+            secs_since_block: self.last_rpc_block_at.map(|t| t.elapsed().as_secs()),
+            finalized_lag: self.system_seen.then(|| self.system.finalized_lag()),
+            peers: self.metrics_seen.then_some(self.metrics.peer_count),
+            disk_pct: self.system_seen.then_some(self.system.disk_used_pct),
+        }
     }
 
     pub fn update_system(&mut self, system: SystemData) {
@@ -181,6 +251,7 @@ impl AppState {
         self.net_tx_prev = system.net_tx_bytes;
 
         self.system = system;
+        self.system_seen = true;
     }
 
     fn calculate_tps(&mut self) {

@@ -56,6 +56,48 @@ Your Monad node must expose:
 | `q` / `Q` / `Esc` | Quit |
 | `t` / `T` | Cycle through themes |
 
+## Alerts
+
+Every threshold is off by default, so running without these flags behaves exactly as before. Set the ones you care about and the monitor notifies a webhook when a threshold trips, and again when it clears.
+
+| Flag | Effect |
+|------|--------|
+| `--webhook-url URL` | Where to POST. Without it, a tripped threshold only colours the TUI |
+| `--alert-no-block SECS` | No new block over the node's WebSocket for this many seconds |
+| `--alert-finalized-lag N` | Finalized lag grows past N blocks |
+| `--alert-min-peers N` | Peer count drops below N |
+| `--alert-disk PCT` | Disk usage rises above this percentage |
+| `--alert-confirm N` | Seconds a change must hold before it counts (default 3) |
+| `--alert-cooldown N` | Shortest gap between two alerts for the same threshold (default 300) |
+
+```bash
+monad-monitor \
+  --webhook-url https://discord.com/api/webhooks/... \
+  --alert-no-block 30 \
+  --alert-min-peers 10 \
+  --alert-disk 85
+```
+
+An incident is two messages, one when the threshold trips and one when it recovers, never a message per refresh. While an alert is up, the affected cell turns red on screen.
+
+Two settings keep a noisy metric from filling a channel. `--alert-confirm` absorbs brief crossings: a change has to hold that many seconds before it counts. `--alert-cooldown` absorbs the harder case, a value that genuinely drifts back and forth across its threshold for minutes at a time; once a threshold has alerted it stays quiet for the cooldown, so a drifting metric costs one pair per cooldown rather than one per crossing. A recovery is never held back, so an incident that was announced is always closed.
+
+`--alert-no-block` watches the WebSocket block stream specifically, so a node that stops delivering blocks trips it even while the metrics endpoint keeps answering.
+
+The payload carries the same human-readable line in `content` and in `text`, which is what Discord and Slack render respectively, so one webhook URL works for either without a translation layer. The structured fields are there for anything else consuming the hook:
+
+```json
+{
+  "content": "🔴 MFNode: peer count (3 peers, threshold 10 peers)",
+  "text": "🔴 MFNode: peer count (3 peers, threshold 10 peers)",
+  "alert": "low_peers",
+  "status": "firing",
+  "value": "3 peers",
+  "threshold": "10 peers",
+  "node": "MFNode"
+}
+```
+
 ## Display
 
 ```

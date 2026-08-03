@@ -1,3 +1,4 @@
+mod alerts;
 mod metrics;
 mod rpc;
 mod snapshot;
@@ -19,8 +20,9 @@ use ratatui::prelude::*;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use crate::alerts::AlertConfig;
 use crate::metrics::{MetricsClient, PrometheusMetrics};
-use crate::rpc::{RpcClient, RpcData};
+use crate::rpc::{RpcClient, RpcEvent};
 use crate::state::AppState;
 use crate::system::{SystemClient, SystemData};
 
@@ -29,18 +31,23 @@ const RPC_ENDPOINT: &str = "ws://localhost:8081";
 const NETWORK: &str = "mainnet";
 const METRICS_REFRESH_INTERVAL_MS: u64 = 1000;
 const SYSTEM_REFRESH_INTERVAL_MS: u64 = 5000;
+/// How often the alert thresholds are evaluated. One second keeps the confirm
+/// window in the configuration readable: it is a count of seconds.
+const ALERT_INTERVAL_MS: u64 = 1000;
 
 enum DataUpdate {
     Metrics(Result<PrometheusMetrics, String>),
-    Rpc(RpcData),
+    Rpc(RpcEvent),
     System(Result<SystemData, String>),
+    Webhook(Result<(), String>),
 }
 
 /// What the command-line arguments asked us to do.
 #[derive(Debug, PartialEq)]
 enum Cli {
-    /// Run the interactive TUI (the default).
-    Tui,
+    /// Run the interactive TUI (the default), with whatever alert thresholds
+    /// were configured.
+    Tui { alerts: AlertConfig },
     /// Print JSON snapshots. `watch` is the interval in seconds for streaming
     /// NDJSON, or `None` for a single snapshot.
     Json { watch: Option<u64> },
@@ -51,6 +58,7 @@ enum Cli {
 fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
     let mut json = false;
     let mut watch: Option<u64> = None;
+    let mut alerts = AlertConfig::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -68,6 +76,13 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
                 }
             }
             "-h" | "--help" => return Ok(Cli::Help),
+            flag if alerts::is_alert_flag(flag) => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| format!("{} requires a value", flag))?;
+                alerts.apply(flag, value)?;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
         i += 1;
@@ -77,10 +92,17 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
         return Err("--watch only applies to --json mode".to_string());
     }
 
+    // The snapshot prints one reading and exits, so it has no state in which to
+    // raise or clear an alert. Saying so beats accepting the flag and ignoring
+    // it.
+    if json && alerts.is_configured() {
+        return Err("alert flags only apply to the TUI, not to --json".to_string());
+    }
+
     if json {
         Ok(Cli::Json { watch })
     } else {
-        Ok(Cli::Tui)
+        Ok(Cli::Tui { alerts })
     }
 }
 
@@ -92,6 +114,15 @@ fn print_help() {
     println!("    monad-monitor --json                 Print one JSON snapshot and exit");
     println!("    monad-monitor --json --watch <secs>  Print a JSON object every <secs> (NDJSON)");
     println!("    monad-monitor --help                 Show this help");
+    println!();
+    println!("ALERTS (TUI only, off unless configured):");
+    println!("    --webhook-url <url>          POST a JSON payload here on each transition");
+    println!("    --alert-no-block <secs>      No new block over the node's WebSocket");
+    println!("    --alert-finalized-lag <n>    Finalized lag past n blocks");
+    println!("    --alert-min-peers <n>        Peer count below n");
+    println!("    --alert-disk <pct>           Disk usage above pct");
+    println!("    --alert-confirm <secs>       Hold time before a change counts (default 3)");
+    println!("    --alert-cooldown <secs>      Gap between alerts for one threshold (default 300)");
     println!();
     println!("The headless snapshot reuses the same data path as the TUI (metrics, RPC and");
     println!("system stats). In one-shot mode the exit status is non-zero when the node is");
@@ -119,11 +150,11 @@ async fn main() -> Result<()> {
             let code = snapshot::run(NETWORK, METRICS_ENDPOINT, RPC_ENDPOINT, watch).await?;
             std::process::exit(code);
         }
-        Cli::Tui => run_tui().await,
+        Cli::Tui { alerts } => run_tui(alerts).await,
     }
 }
 
-async fn run_tui() -> Result<()> {
+async fn run_tui(alert_config: AlertConfig) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -132,7 +163,7 @@ async fn run_tui() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run app
-    let result = run_app(&mut terminal).await;
+    let result = run_app(&mut terminal, alert_config).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -150,22 +181,28 @@ async fn run_tui() -> Result<()> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, alert_config: AlertConfig) -> Result<()> {
     let mut state = AppState::new();
+
+    // One client for every webhook POST, and only when a webhook is configured.
+    let webhook_client = alert_config
+        .webhook_url
+        .as_ref()
+        .map(|_| reqwest::Client::new());
 
     // Channel for receiving data updates from background tasks
     let (tx, mut rx) = mpsc::channel::<DataUpdate>(100);
 
     // Spawn RPC subscription (real-time block updates)
-    let (rpc_tx, mut rpc_rx) = mpsc::channel::<RpcData>(100);
+    let (rpc_tx, mut rpc_rx) = mpsc::channel::<RpcEvent>(100);
     let rpc_client = RpcClient::new(RPC_ENDPOINT);
     rpc_client.subscribe(rpc_tx);
 
     // Forward RPC updates to main channel
     let tx_rpc = tx.clone();
     tokio::spawn(async move {
-        while let Some(rpc_data) = rpc_rx.recv().await {
-            let _ = tx_rpc.send(DataUpdate::Rpc(rpc_data)).await;
+        while let Some(event) = rpc_rx.recv().await {
+            let _ = tx_rpc.send(DataUpdate::Rpc(event)).await;
         }
     });
 
@@ -205,6 +242,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     // UI refresh ticker for smooth animations (100ms = 10fps)
     let mut ui_ticker = interval(Duration::from_millis(100));
 
+    // Alert evaluation runs on its own beat, not on the draw loop: thresholds
+    // are about how long something has been true, not how often the screen
+    // redraws.
+    let mut alert_ticker = interval(Duration::from_millis(ALERT_INTERVAL_MS));
+    // Monotonic reference for the alert cooldown; only differences matter.
+    let started = std::time::Instant::now();
+
     loop {
         // Draw UI
         terminal.draw(|frame| ui::draw(frame, &state))?;
@@ -233,9 +277,40 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 match update {
                     DataUpdate::Metrics(Ok(metrics)) => state.update_metrics(metrics),
                     DataUpdate::Metrics(Err(e)) => state.set_error(format!("metrics: {}", e)),
-                    DataUpdate::Rpc(rpc_data) => state.update_rpc(rpc_data),
+                    DataUpdate::Rpc(RpcEvent::Data(rpc_data)) => state.update_rpc(rpc_data),
+                    DataUpdate::Rpc(RpcEvent::Connected) => state.set_ws_connected(),
+                    DataUpdate::Rpc(RpcEvent::Disconnected(reason)) => state.set_ws_disconnected(reason),
                     DataUpdate::System(Ok(system)) => state.update_system(system),
                     DataUpdate::System(Err(e)) => state.set_error(format!("system: {}", e)),
+                    DataUpdate::Webhook(result) => state.set_webhook_result(result),
+                }
+            }
+
+            // Threshold evaluation
+            _ = alert_ticker.tick() => {
+                if alert_config.is_enabled() {
+                    let sample = state.alert_sample();
+                    let now = started.elapsed().as_secs();
+                    let transitions = alerts::evaluate(&mut state.alerts, &alert_config, &sample, now);
+
+                    if let (Some(client), Some(url)) = (&webhook_client, &alert_config.webhook_url) {
+                        let node = state.system.node_id.clone();
+                        for transition in transitions {
+                            // Spawned, so a slow webhook cannot delay the next
+                            // frame or the next evaluation. The outcome comes
+                            // back through the same channel as every other
+                            // source, so a webhook that stops delivering says
+                            // so on screen.
+                            let client = client.clone();
+                            let url = url.clone();
+                            let body = transition.payload(&node);
+                            let tx_webhook = tx.clone();
+                            tokio::spawn(async move {
+                                let result = alerts::post(client, url, body).await;
+                                let _ = tx_webhook.send(DataUpdate::Webhook(result)).await;
+                            });
+                        }
+                    }
                 }
             }
 
@@ -257,7 +332,46 @@ mod tests {
 
     #[test]
     fn no_args_runs_the_tui() {
-        assert_eq!(parse_args(&args(&[])).unwrap(), Cli::Tui);
+        assert_eq!(
+            parse_args(&args(&[])).unwrap(),
+            Cli::Tui {
+                alerts: AlertConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn alert_flags_configure_the_tui() {
+        let cli = parse_args(&args(&[
+            "--alert-min-peers",
+            "10",
+            "--webhook-url",
+            "https://example.com/hook",
+        ]))
+        .unwrap();
+
+        match cli {
+            Cli::Tui { alerts } => {
+                assert_eq!(alerts.min_peers, Some(10));
+                assert_eq!(alerts.webhook_url.as_deref(), Some("https://example.com/hook"));
+                assert!(alerts.is_configured());
+            }
+            other => panic!("expected the TUI, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_mistyped_alert_flag_is_rejected_rather_than_ignored() {
+        // Silently skipping this would leave the operator believing a threshold
+        // is armed when nothing is watching it.
+        assert!(parse_args(&args(&["--alert-noblock", "30"])).is_err());
+        assert!(parse_args(&args(&["--alert-min-peers"])).is_err());
+        assert!(parse_args(&args(&["--alert-min-peers", "lots"])).is_err());
+    }
+
+    #[test]
+    fn alert_flags_are_rejected_in_json_mode() {
+        assert!(parse_args(&args(&["--json", "--alert-min-peers", "10"])).is_err());
     }
 
     #[test]
