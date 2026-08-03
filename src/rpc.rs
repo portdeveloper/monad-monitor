@@ -1,10 +1,26 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+/// A node that stops answering must not park the subscription: if nothing
+/// arrives within this window the connection is treated as dead and retried.
+/// New heads land roughly twice a second, so this leaves a wide margin.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The opening requests either come back promptly or the endpoint is not
+/// usable, and waiting forever on them hides the problem.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reconnect delay, doubling up to the ceiling. A node that is down stays down
+/// for a while, and retrying in a tight loop only adds load to a host that is
+/// already having a bad time.
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Block {
@@ -22,6 +38,15 @@ pub struct RpcData {
     pub gas_price_gwei: f64,
     pub recent_blocks: Vec<Block>,
     pub client_version: String,
+}
+
+/// What the subscription reports back. The stream going away is news in its own
+/// right: without it a dead connection is indistinguishable from a quiet one.
+#[derive(Debug, Clone)]
+pub enum RpcEvent {
+    Data(RpcData),
+    Connected,
+    Disconnected(String),
 }
 
 #[derive(Serialize)]
@@ -57,18 +82,31 @@ impl RpcClient {
     }
 
     /// Spawn a background task that subscribes to new blocks and sends updates
-    pub fn subscribe(
-        &self,
-        tx: mpsc::Sender<RpcData>,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn subscribe(&self, tx: mpsc::Sender<RpcEvent>) -> tokio::task::JoinHandle<()> {
         let endpoint = self.endpoint.clone();
 
         tokio::spawn(async move {
+            let mut backoff = RECONNECT_MIN;
+
             loop {
-                if let Err(_) = run_subscription(&endpoint, &tx).await {
-                    // Reconnect after a brief delay on error
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                }
+                // Every way out of a subscription is a disconnect, including
+                // the clean ones: a server-side close ends the stream just as
+                // surely as a transport error does.
+                let reason = match run_subscription(&endpoint, &tx).await {
+                    Ok(streamed) => {
+                        // Reaching the stream means the endpoint is healthy, so
+                        // the next retry starts from the short delay again.
+                        if streamed {
+                            backoff = RECONNECT_MIN;
+                        }
+                        "connection closed by the node".to_string()
+                    }
+                    Err(e) => format!("{:#}", e),
+                };
+                let _ = tx.send(RpcEvent::Disconnected(reason)).await;
+
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX);
             }
         })
     }
@@ -137,7 +175,10 @@ impl RpcClient {
     }
 }
 
-async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<()> {
+/// Runs one connection until it ends. `Ok(true)` means the subscription was
+/// live and streaming before it dropped, which is what tells the caller the
+/// endpoint itself is fine.
+async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result<bool> {
     let (ws_stream, _) = connect_async(endpoint)
         .await
         .context("Failed to connect to WebSocket")?;
@@ -174,11 +215,13 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<
         write.send(Message::Text(text)).await?;
     }
 
-    // Collect initial responses
+    // Collect initial responses. A node that answers some of these and then
+    // goes quiet used to leave this loop waiting forever; the timeout turns
+    // that into a reconnect instead.
     let mut responses: HashMap<u32, Value> = HashMap::new();
     let mut received = 0;
     while received < 3 {
-        if let Some(Ok(Message::Text(text))) = read.next().await {
+        if let Message::Text(text) = read_message(&mut read, HANDSHAKE_TIMEOUT).await? {
             if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
                 if let (Some(id), Some(result)) = (resp.id, resp.result) {
                     responses.insert(id, result);
@@ -211,7 +254,7 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<
     }
 
     // Send initial data
-    let _ = tx.send(data.clone()).await;
+    let _ = tx.send(RpcEvent::Data(data.clone())).await;
 
     // Subscribe to new block headers
     let subscribe_req = JsonRpcRequest {
@@ -222,10 +265,15 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<
     };
     write.send(Message::Text(serde_json::to_string(&subscribe_req)?)).await?;
 
+    // Past this point the connection is established and streaming, which is
+    // what the caller needs to know to reset its reconnect delay.
+    let _ = tx.send(RpcEvent::Connected).await;
+
     // Process incoming messages
-    while let Some(msg) = read.next().await {
+    loop {
+        let msg = read_message(&mut read, READ_TIMEOUT).await?;
         match msg {
-            Ok(Message::Text(text)) => {
+            Message::Text(text) => {
                 if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
                     // Check if this is a subscription notification
                     if resp.method.as_deref() == Some("eth_subscription") {
@@ -287,7 +335,7 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<
                                 write.send(Message::Text(serde_json::to_string(&gas_req)?)).await?;
 
                                 // Send update immediately
-                                let _ = tx.send(data.clone()).await;
+                                let _ = tx.send(RpcEvent::Data(data.clone())).await;
                             }
                         }
                     } else if let (Some(id), Some(result)) = (resp.id, resp.result) {
@@ -303,7 +351,7 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<
                             if let Some(block) = data.recent_blocks.iter_mut().find(|b| b.number % 100000 == block_num_suffix) {
                                 block.tx_count = tx_count;
                             }
-                            let _ = tx.send(data.clone()).await;
+                            let _ = tx.send(RpcEvent::Data(data.clone())).await;
                         } else if id == 1001 {
                             // Gas price response
                             if let Some(hex) = result.as_str() {
@@ -313,13 +361,31 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcData>) -> Result<
                     }
                 }
             }
-            Ok(Message::Close(_)) => break,
-            Err(_) => break,
+            Message::Close(_) => break,
+            // Anything else (a ping, a binary frame) is still traffic, so it
+            // counts as the connection being alive and resets the read window.
             _ => {}
         }
     }
 
-    Ok(())
+    Ok(true)
+}
+
+/// Reads one frame, or fails. Every wait on the socket goes through here so a
+/// silent node surfaces as an error instead of parking the task.
+async fn read_message<R>(read: &mut R, limit: Duration) -> Result<Message>
+where
+    R: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    match tokio::time::timeout(limit, read.next()).await {
+        Err(_) => Err(anyhow!(
+            "no response from the node for {}s",
+            limit.as_secs()
+        )),
+        Ok(None) => Err(anyhow!("connection closed")),
+        Ok(Some(Err(e))) => Err(e).context("websocket read failed"),
+        Ok(Some(Ok(msg))) => Ok(msg),
+    }
 }
 
 async fn fetch_blocks<S, R>(
@@ -346,11 +412,13 @@ where
         write.send(Message::Text(serde_json::to_string(&req)?)).await.ok();
     }
 
-    // Collect responses
+    // Collect responses. One request going unanswered used to hang the whole
+    // subscription here, so this waits on the same bounded read as everything
+    // else and gives up to the reconnect path if the node stops replying.
     let mut block_responses: HashMap<u32, Value> = HashMap::new();
     let mut received = 0;
     while received < count {
-        if let Some(Ok(Message::Text(text))) = read.next().await {
+        if let Message::Text(text) = read_message(read, HANDSHAKE_TIMEOUT).await? {
             if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
                 if let (Some(id), Some(result)) = (resp.id, resp.result) {
                     if id >= 100 && id < 100 + count {
