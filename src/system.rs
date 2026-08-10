@@ -207,81 +207,94 @@ fn fetch_services_status() -> (bool, bool, bool, u64) {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    // Get service start time from monad-bft (parse ActiveEnterTimestamp)
-    let started_at = Command::new("systemctl")
-        .args(["show", "monad-bft", "--property=ActiveEnterTimestamp"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| parse_systemd_timestamp(&s))
-        .unwrap_or(0);
-
-    (bft, execution, rpc, started_at)
+    (bft, execution, rpc, service_started_at())
 }
 
-/// Parse systemd timestamp like "ActiveEnterTimestamp=Thu 2025-12-11 21:20:59 CET"
-fn parse_systemd_timestamp(output: &str) -> Option<u64> {
-    // Extract the timestamp part after "="
-    let ts_str = output.split('=').nth(1)?.trim();
-    if ts_str.is_empty() || ts_str == "n/a" {
-        return None;
-    }
-
-    // Parse format: "Thu 2025-12-11 21:20:59 CET"
-    // Skip day name, parse date and time
-    let parts: Vec<&str> = ts_str.split_whitespace().collect();
-    if parts.len() < 3 {
-        return None;
-    }
-
-    let date = parts[1]; // "2025-12-11"
-    let time = parts[2]; // "21:20:59"
-
-    // Parse date
-    let date_parts: Vec<u32> = date.split('-').filter_map(|s| s.parse().ok()).collect();
-    if date_parts.len() != 3 {
-        return None;
-    }
-
-    // Parse time
-    let time_parts: Vec<u32> = time.split(':').filter_map(|s| s.parse().ok()).collect();
-    if time_parts.len() != 3 {
-        return None;
-    }
-
-    // Simple approximation - convert to seconds since epoch
-    // This is a rough calculation but good enough for uptime display
-    let year = date_parts[0] as u64;
-    let month = date_parts[1] as u64;
-    let day = date_parts[2] as u64;
-    let hour = time_parts[0] as u64;
-    let min = time_parts[1] as u64;
-    let sec = time_parts[2] as u64;
-
-    // Days since epoch (Jan 1, 1970), simplified
-    let years_since_1970 = year.saturating_sub(1970);
-    let leap_years = (years_since_1970 + 1) / 4; // rough estimate
-    let days_in_prev_months: u64 = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => 0,
+/// The epoch second monad-bft last became active.
+///
+/// systemd knows this exactly, so it is asked for it rather than having its
+/// localized output reconstructed: a printed timestamp carries a time zone that
+/// has to be interpreted, and interpreting it wrongly is silent.
+fn service_started_at() -> u64 {
+    let show = |args: &[&str]| {
+        Command::new("systemctl")
+            .args(args)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
     };
 
-    let total_days = years_since_1970 * 365 + leap_years + days_in_prev_months + day - 1;
-    let total_secs = total_days * 86400 + hour * 3600 + min * 60 + sec;
+    // systemd 251 and newer hand back the epoch directly.
+    if let Some(started) = show(&[
+        "show",
+        "monad-bft",
+        "--property=ActiveEnterTimestamp",
+        "--timestamp=unix",
+    ])
+    .and_then(|out| parse_unix_timestamp(&out))
+    {
+        return started;
+    }
 
-    // Adjust for timezone (assume CET = UTC+1, subtract 1 hour)
-    Some(total_secs.saturating_sub(3600))
+    // Older systemd rejects that flag (Ubuntu 22.04 ships 249), so derive the
+    // epoch from the monotonic clock and the boot time, which every supported
+    // version reports.
+    match (
+        show(&[
+            "show",
+            "monad-bft",
+            "--property=ActiveEnterTimestampMonotonic",
+        ]),
+        boot_time(),
+    ) {
+        (Some(out), Some(boot)) => parse_monotonic_timestamp(&out, boot).unwrap_or(0),
+        // Unknown beats guessed: 0 renders as "..." rather than a wrong number.
+        _ => 0,
+    }
+}
+
+/// The value side of a `systemctl show --property=X` line, or `None` when the
+/// property is missing, empty, or one of systemd's "no such moment" markers. A
+/// unit that does not exist exits 0 with an empty value, so the exit status
+/// alone would not catch it.
+fn property_value(output: &str) -> Option<&str> {
+    let value = output.split_once('=')?.1.trim();
+    if value.is_empty() || value == "n/a" || value == "never" {
+        return None;
+    }
+    Some(value)
+}
+
+/// Parses `ActiveEnterTimestamp=@1785564987`, the form systemd prints under
+/// `--timestamp=unix`. An epoch needs no calendar and no time zone.
+fn parse_unix_timestamp(output: &str) -> Option<u64> {
+    // Only the @epoch form is accepted. A systemd too old for the flag ignores
+    // it and prints its localized string instead, and reading that as a moment
+    // in time is exactly the guesswork this replaces.
+    property_value(output)?.strip_prefix('@')?.parse().ok()
+}
+
+/// Parses `ActiveEnterTimestampMonotonic=…`, microseconds since boot, into an
+/// epoch using the boot time.
+fn parse_monotonic_timestamp(output: &str, boot_time: u64) -> Option<u64> {
+    let micros: u64 = property_value(output)?.parse().ok()?;
+    // Zero means the unit has never been activated. Added to the boot time it
+    // would claim the service came up the instant the machine did.
+    if micros == 0 {
+        return None;
+    }
+    Some(boot_time + micros / 1_000_000)
+}
+
+/// Boot time as an epoch, from `btime` in /proc/stat.
+fn boot_time() -> Option<u64> {
+    parse_btime(&fs::read_to_string("/proc/stat").ok()?)
+}
+
+fn parse_btime(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|value| value.trim().parse().ok())
 }
 
 /// Returns (mem_pct, mem_used_gb, mem_total_gb, cpu_pct, net_rx, net_tx)
@@ -300,9 +313,17 @@ fn fetch_system_resources() -> (f64, f64, f64, f64, u64, u64) {
 
         for line in meminfo.lines() {
             if line.starts_with("MemTotal:") {
-                total_kb = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                total_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
             } else if line.starts_with("MemAvailable:") {
-                available_kb = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                available_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
             }
         }
 
@@ -497,5 +518,71 @@ mod tests {
         assert_eq!(data.history_latest, 500);
         assert_eq!(data.latest_finalized, 498);
         assert_eq!(data.finalized_lag(), 2);
+    }
+
+    #[test]
+    fn the_unix_form_is_taken_as_an_epoch() {
+        // systemd 251 and newer, with --timestamp=unix. Straight from a
+        // mainnet node.
+        let out = "ActiveEnterTimestamp=@1785564987\n";
+        assert_eq!(parse_unix_timestamp(out), Some(1785564987));
+    }
+
+    #[test]
+    fn the_localized_string_is_refused_rather_than_reconstructed() {
+        // What systemd prints without the flag, and what the previous
+        // implementation rebuilt an epoch from. Turning this into a moment in
+        // time means assuming a time zone, which is the bug being replaced, so
+        // it has to be rejected rather than parsed loosely.
+        let out = "ActiveEnterTimestamp=Sat 2026-08-01 06:16:27 UTC\n";
+        assert_eq!(parse_unix_timestamp(out), None);
+    }
+
+    #[test]
+    fn an_absent_or_unset_property_is_unknown() {
+        // A unit that does not exist: systemctl exits 0 with an empty value, so
+        // the exit status alone would not catch it.
+        assert_eq!(parse_unix_timestamp("ActiveEnterTimestamp=\n"), None);
+        assert_eq!(parse_unix_timestamp("ActiveEnterTimestamp=n/a\n"), None);
+        assert_eq!(parse_unix_timestamp("ActiveEnterTimestamp=@\n"), None);
+        assert_eq!(parse_unix_timestamp("no equals sign here"), None);
+    }
+
+    #[test]
+    fn the_monotonic_form_is_offset_from_boot() {
+        // Microseconds since boot: 2h 30m after a machine that booted at
+        // 1785000000.
+        let out = "ActiveEnterTimestampMonotonic=9000000000\n";
+        assert_eq!(
+            parse_monotonic_timestamp(out, 1_785_000_000),
+            Some(1_785_009_000)
+        );
+    }
+
+    #[test]
+    fn a_never_activated_unit_does_not_inherit_the_boot_time() {
+        // Monotonic is 0 for a unit that has never come up. Added to the boot
+        // time it would report the service as old as the machine.
+        let out = "ActiveEnterTimestampMonotonic=0\n";
+        assert_eq!(parse_monotonic_timestamp(out, 1_785_000_000), None);
+
+        let out = "ActiveEnterTimestampMonotonic=\n";
+        assert_eq!(parse_monotonic_timestamp(out, 1_785_000_000), None);
+    }
+
+    #[test]
+    fn boot_time_comes_from_btime() {
+        let stat = "cpu  1 2 3 4 5 6 7\nintr 0\nctxt 123\nbtime 1768143387\nprocesses 9\n";
+        assert_eq!(parse_btime(stat), Some(1768143387));
+
+        // A kernel that does not report it leaves the fallback unusable, which
+        // is reported as unknown rather than as an epoch near 1970.
+        assert_eq!(parse_btime("cpu  1 2 3 4\nprocesses 9\n"), None);
+    }
+
+    #[test]
+    fn uptime_is_unknown_without_a_start_time() {
+        let data = SystemData::default();
+        assert_eq!(data.uptime_since_restart(), "...");
     }
 }
