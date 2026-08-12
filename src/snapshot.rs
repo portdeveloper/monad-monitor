@@ -84,7 +84,7 @@ fn now_ms() -> u64 {
 async fn collect(
     state: &mut AppState,
     metrics: &MetricsClient,
-    system: &SystemClient,
+    system: &mut SystemClient,
     rpc: &RpcClient,
 ) -> bool {
     let metrics_ok = if let Ok(Ok(m)) = timeout(FETCH_TIMEOUT, metrics.fetch()).await {
@@ -118,7 +118,7 @@ pub async fn run(
     watch: Option<u64>,
 ) -> Result<i32> {
     let metrics = MetricsClient::new(metrics_endpoint);
-    let system = SystemClient::new(network);
+    let mut system = SystemClient::new(network);
     let rpc = RpcClient::new(rpc_endpoint);
     let mut state = AppState::new();
 
@@ -126,9 +126,9 @@ pub async fn run(
         None => {
             // Two readings a second apart so TPS (a rate) is meaningful rather
             // than always zero on a single reading.
-            collect(&mut state, &metrics, &system, &rpc).await;
+            collect(&mut state, &metrics, &mut system, &rpc).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let reachable = collect(&mut state, &metrics, &system, &rpc).await;
+            let reachable = collect(&mut state, &metrics, &mut system, &rpc).await;
 
             let snap = Snapshot::from_state(&state, network, reachable);
             println!("{}", serde_json::to_string(&snap)?);
@@ -137,13 +137,13 @@ pub async fn run(
         Some(secs) => {
             let period = Duration::from_secs(secs.max(1));
             // Prime one reading so the first emitted line already has a TPS.
-            collect(&mut state, &metrics, &system, &rpc).await;
+            collect(&mut state, &metrics, &mut system, &rpc).await;
 
             let mut ticker = tokio::time::interval(period);
             let stdout = std::io::stdout();
             loop {
                 ticker.tick().await;
-                let reachable = collect(&mut state, &metrics, &system, &rpc).await;
+                let reachable = collect(&mut state, &metrics, &mut system, &rpc).await;
                 let snap = Snapshot::from_state(&state, network, reachable);
                 let line = serde_json::to_string(&snap)?;
                 let mut handle = stdout.lock();

@@ -31,7 +31,10 @@ pub struct SystemData {
     pub memory_used_pct: f64,
     pub memory_used_gb: f64,
     pub memory_total_gb: f64,
-    pub cpu_usage_pct: f64,
+    /// Busy percentage over the interval between the last two samples. `None`
+    /// until a second sample exists, because a rate needs two readings and one
+    /// reading can only produce an average over all of uptime.
+    pub cpu_usage_pct: Option<f64>,
 
     // Network (bytes since boot, for calculating rate)
     pub net_rx_bytes: u64,
@@ -91,18 +94,33 @@ impl SystemData {
     }
 }
 
+/// The cumulative CPU counters from /proc/stat. They only mean something as a
+/// difference between two readings, so they are kept rather than turned into a
+/// percentage on the spot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CpuTimes {
+    /// Time not spent working: idle plus iowait.
+    idle: u64,
+    /// All accounted time.
+    total: u64,
+}
+
 pub struct SystemClient {
     network: String,
+    /// The previous CPU reading, held so each sample can be compared with the
+    /// one before it.
+    cpu_prev: Option<CpuTimes>,
 }
 
 impl SystemClient {
     pub fn new(network: &str) -> Self {
         Self {
             network: network.to_string(),
+            cpu_prev: None,
         }
     }
 
-    pub async fn fetch(&self) -> Result<SystemData> {
+    pub async fn fetch(&mut self) -> Result<SystemData> {
         let mut data = SystemData::default();
 
         // Fetch monad-mpt data (blocking, but fast)
@@ -135,9 +153,20 @@ impl SystemClient {
             data.memory_used_pct = resources.0;
             data.memory_used_gb = resources.1;
             data.memory_total_gb = resources.2;
-            data.cpu_usage_pct = resources.3;
             data.net_rx_bytes = resources.4;
             data.net_tx_bytes = resources.5;
+
+            // CPU is a rate, so it comes from the change since the previous
+            // sample. The first sample has nothing to compare against and
+            // reports nothing rather than an average over all of uptime.
+            let now = resources.3;
+            data.cpu_usage_pct = match (self.cpu_prev, now) {
+                (Some(prev), Some(now)) => cpu_percentage(prev, now),
+                _ => None,
+            };
+            if now.is_some() {
+                self.cpu_prev = now;
+            }
         }
 
         // Fetch hostname
@@ -297,12 +326,11 @@ fn parse_btime(stat: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-/// Returns (mem_pct, mem_used_gb, mem_total_gb, cpu_pct, net_rx, net_tx)
-fn fetch_system_resources() -> (f64, f64, f64, f64, u64, u64) {
+/// Returns (mem_pct, mem_used_gb, mem_total_gb, cpu_times, net_rx, net_tx)
+fn fetch_system_resources() -> (f64, f64, f64, Option<CpuTimes>, u64, u64) {
     let mut mem_pct = 0.0;
     let mut mem_used_gb = 0.0;
     let mut mem_total_gb = 0.0;
-    let mut cpu_pct = 0.0;
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
 
@@ -335,24 +363,12 @@ fn fetch_system_resources() -> (f64, f64, f64, f64, u64, u64) {
         }
     }
 
-    // Parse /proc/stat for CPU (simplified - just idle percentage)
-    if let Ok(stat) = fs::read_to_string("/proc/stat") {
-        if let Some(cpu_line) = stat.lines().next() {
-            let parts: Vec<u64> = cpu_line
-                .split_whitespace()
-                .skip(1) // skip "cpu"
-                .filter_map(|s| s.parse().ok())
-                .collect();
-
-            if parts.len() >= 4 {
-                let total: u64 = parts.iter().sum();
-                let idle = parts.get(3).unwrap_or(&0);
-                if total > 0 {
-                    cpu_pct = 100.0 - (*idle as f64 / total as f64 * 100.0);
-                }
-            }
-        }
-    }
+    // Read the CPU counters. They are cumulative, so the percentage is worked
+    // out one level up, from the difference against the previous reading.
+    let cpu_times = fs::read_to_string("/proc/stat")
+        .ok()
+        .as_deref()
+        .and_then(parse_cpu_times);
 
     // Parse /proc/net/dev for network stats (sum all interfaces except lo)
     if let Ok(netdev) = fs::read_to_string("/proc/net/dev") {
@@ -374,7 +390,55 @@ fn fetch_system_resources() -> (f64, f64, f64, f64, u64, u64) {
         }
     }
 
-    (mem_pct, mem_used_gb, mem_total_gb, cpu_pct, net_rx, net_tx)
+    (
+        mem_pct,
+        mem_used_gb,
+        mem_total_gb,
+        cpu_times,
+        net_rx,
+        net_tx,
+    )
+}
+
+/// Reads the aggregate `cpu` line of /proc/stat.
+///
+/// The fields are cumulative jiffies since boot: user, nice, system, idle,
+/// iowait, irq, softirq, steal, and then guest and guest_nice. The guest pair is
+/// already included in user and nice, so summing every field would count that
+/// time twice; only the first eight are added up.
+fn parse_cpu_times(stat: &str) -> Option<CpuTimes> {
+    let fields: Vec<u64> = stat
+        .lines()
+        .next()?
+        .strip_prefix("cpu ")?
+        .split_whitespace()
+        .filter_map(|field| field.parse().ok())
+        .collect();
+
+    if fields.len() < 5 {
+        return None;
+    }
+
+    Some(CpuTimes {
+        // iowait is the CPU waiting on storage, not working, so it belongs with
+        // idle. Counting it as busy is what made a node doing heavy disk I/O
+        // look pegged.
+        idle: fields[3] + fields[4],
+        total: fields.iter().take(8).sum(),
+    })
+}
+
+/// Busy percentage over the interval between two readings.
+fn cpu_percentage(prev: CpuTimes, now: CpuTimes) -> Option<f64> {
+    // Counters only move forward; anything else means the reading is not
+    // comparable, so report nothing rather than a number from a bad subtraction.
+    let total = now.total.checked_sub(prev.total)?;
+    let idle = now.idle.checked_sub(prev.idle)?;
+    if total == 0 || idle > total {
+        return None;
+    }
+
+    Some((total - idle) as f64 / total as f64 * 100.0)
 }
 
 fn is_size_unit(s: &str) -> bool {
@@ -584,5 +648,56 @@ mod tests {
     fn uptime_is_unknown_without_a_start_time() {
         let data = SystemData::default();
         assert_eq!(data.uptime_since_restart(), "...");
+    }
+
+    #[test]
+    fn cpu_times_come_from_the_aggregate_line() {
+        // user nice system idle iowait irq softirq steal guest guest_nice
+        let stat = "cpu  100 5 50 800 40 3 2 10 7 1\ncpu0 1 2 3 4 5 6 7 8\n";
+        let times = parse_cpu_times(stat).unwrap();
+        // idle + iowait: waiting on storage is not working.
+        assert_eq!(times.idle, 840);
+        // The first eight fields only: guest time is already inside user and
+        // nice, so including fields nine and ten would count it twice.
+        assert_eq!(times.total, 1010);
+
+        assert_eq!(parse_cpu_times("intr 0 1 2\n"), None);
+        assert_eq!(parse_cpu_times("cpu  1 2 3\n"), None);
+    }
+
+    #[test]
+    fn cpu_percentage_is_the_rate_between_two_readings() {
+        let prev = CpuTimes {
+            idle: 800,
+            total: 1000,
+        };
+        // 500 elapsed, 400 of it idle: 20% busy over the window, regardless of
+        // what the counters accumulated before it.
+        let now = CpuTimes {
+            idle: 1200,
+            total: 1500,
+        };
+        assert_eq!(cpu_percentage(prev, now), Some(20.0));
+    }
+
+    #[test]
+    fn an_unusable_pair_of_readings_reports_nothing() {
+        let base = CpuTimes {
+            idle: 800,
+            total: 1000,
+        };
+        // No time elapsed between reads.
+        assert_eq!(cpu_percentage(base, base), None);
+        // Counters that went backwards are not comparable.
+        assert_eq!(
+            cpu_percentage(
+                base,
+                CpuTimes {
+                    idle: 700,
+                    total: 900
+                }
+            ),
+            None
+        );
     }
 }

@@ -352,13 +352,13 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
     // Build stats line
     let sys = &state.system;
 
-    // CPU usage
-    let cpu_color = if sys.cpu_usage_pct < 50.0 {
-        Color::Green
-    } else if sys.cpu_usage_pct < 80.0 {
-        Color::Yellow
-    } else {
-        Color::Red
+    // CPU usage. Unknown until a second sample arrives, since the figure is a
+    // rate over the interval between two readings.
+    let (cpu_text, cpu_color) = match sys.cpu_usage_pct {
+        Some(pct) if pct < 50.0 => (format!("{:.0}%", pct), Color::Green),
+        Some(pct) if pct < 80.0 => (format!("{:.0}%", pct), Color::Yellow),
+        Some(pct) => (format!("{:.0}%", pct), Color::Red),
+        None => ("...".to_string(), label_color),
     };
 
     // Memory usage
@@ -396,7 +396,7 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
 
     let stats = Line::from(vec![
         Span::styled("CPU: ", Style::default().fg(label_color)),
-        Span::styled(format!("{:.0}%", sys.cpu_usage_pct), Style::default().fg(cpu_color)),
+        Span::styled(cpu_text, Style::default().fg(cpu_color)),
         Span::raw("  |  "),
         Span::styled("MEM: ", Style::default().fg(label_color)),
         Span::styled(format!("{:.0}%", sys.memory_used_pct), Style::default().fg(mem_color)),
