@@ -224,7 +224,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, alert_config: AlertConf
     // Spawn background data fetcher for system data (less frequent)
     let tx_system = tx.clone();
     tokio::spawn(async move {
-        let system_client = SystemClient::new(NETWORK);
+        let mut system_client = SystemClient::new(NETWORK);
         let mut refresh_interval = interval(Duration::from_millis(SYSTEM_REFRESH_INTERVAL_MS));
 
         loop {
