@@ -41,11 +41,56 @@ Run on a machine with a Monad node:
 monad-monitor
 ```
 
+Or point it at a node on another host or on other ports:
+
+```bash
+monad-monitor --metrics-url http://node:8889/metrics --ws-url ws://node:8081
+```
+
+### Endpoint options
+
+Every default is the value the monitor used to hardcode, so a run with no flags
+behaves exactly as it did before. `monad-monitor --help` lists every flag,
+including the alert thresholds further down.
+
+| Flag | Default | What it sets |
+|------|---------|--------------|
+| `--metrics-url <URL>` | `http://localhost:8889/metrics` | Prometheus endpoint the monitor scrapes |
+| `--ws-url <URL>` | `ws://localhost:8081` | The node's WebSocket, for real-time blocks |
+| `--refresh <secs>` | `1` | How often the metrics endpoint is scraped (TUI only) |
+| `--network <name>` | `mainnet` | Network whose public node the block height is compared against, as `wss://rpc-<name>.monadinfra.com` |
+| `--external-rpc-url <URL>` | built from `--network` | That comparison endpoint, given outright |
+
+A URL is checked where it is given, so `--ws-url http://node:8081` is refused up
+front rather than failing later as a WebSocket that never connects. An
+unreachable endpoint reports the URL it tried.
+
+### Config file
+
+The same settings can live in a file, so a host with a fixed setup does not need
+the flags on every run. The monitor reads
+`$XDG_CONFIG_HOME/monad-monitor/config.toml`, falling back to
+`~/.config/monad-monitor/config.toml` when `XDG_CONFIG_HOME` is unset. The file
+is optional.
+
+```toml
+metrics_url = "http://node:8889/metrics"
+ws_url = "ws://node:8081"
+refresh = 5
+network = "testnet"
+# external_rpc_url = "wss://rpc-testnet.monadinfra.com"
+```
+
+Keys are the flag names with underscores. Precedence runs one way: a flag beats
+the file and the file beats the default. An unset key keeps its default. An
+unknown key is an error naming the line, so a typo cannot leave you watching
+localhost while you believe you pointed the monitor somewhere else.
+
 ### Requirements
 
 Your Monad node must expose:
 - **Prometheus metrics** on `http://localhost:8889/metrics`
-- **WebSocket endpoint** on `ws://localhost:8080` (used for real-time block subscriptions)
+- **WebSocket endpoint** on `ws://localhost:8081` (used for real-time block subscriptions)
 
 > **Note:** WebSocket support must be enabled on your node. See the [Monad Events and WebSockets documentation](https://docs.monad.xyz/node-ops/events-and-websockets) for setup instructions.
 

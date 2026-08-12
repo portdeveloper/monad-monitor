@@ -1,4 +1,5 @@
 mod alerts;
+mod config;
 mod metrics;
 mod rpc;
 mod snapshot;
@@ -21,15 +22,12 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 
 use crate::alerts::AlertConfig;
+use crate::config::Config;
 use crate::metrics::{MetricsClient, PrometheusMetrics};
 use crate::rpc::{RpcClient, RpcEvent};
 use crate::state::AppState;
 use crate::system::{SystemClient, SystemData};
 
-const METRICS_ENDPOINT: &str = "http://localhost:8889/metrics";
-const RPC_ENDPOINT: &str = "ws://localhost:8081";
-const NETWORK: &str = "mainnet";
-const METRICS_REFRESH_INTERVAL_MS: u64 = 1000;
 const SYSTEM_REFRESH_INTERVAL_MS: u64 = 5000;
 /// How often the alert thresholds are evaluated. One second keeps the confirm
 /// window in the configuration readable: it is a count of seconds.
@@ -46,11 +44,17 @@ enum DataUpdate {
 #[derive(Debug, PartialEq)]
 enum Cli {
     /// Run the interactive TUI (the default), with whatever alert thresholds
-    /// were configured.
-    Tui { alerts: AlertConfig },
+    /// and endpoints were configured.
+    Tui {
+        alerts: AlertConfig,
+        endpoints: config::Layer,
+    },
     /// Print JSON snapshots. `watch` is the interval in seconds for streaming
     /// NDJSON, or `None` for a single snapshot.
-    Json { watch: Option<u64> },
+    Json {
+        watch: Option<u64>,
+        endpoints: config::Layer,
+    },
     /// Print usage and exit.
     Help,
 }
@@ -59,6 +63,7 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
     let mut json = false;
     let mut watch: Option<u64> = None;
     let mut alerts = AlertConfig::default();
+    let mut endpoints = config::Layer::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -83,6 +88,13 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
                     .ok_or_else(|| format!("{} requires a value", flag))?;
                 alerts.apply(flag, value)?;
             }
+            flag if config::is_config_flag(flag) => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| format!("{} requires a value", flag))?;
+                endpoints.apply_flag(flag, value)?;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
         i += 1;
@@ -99,10 +111,19 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
         return Err("alert flags only apply to the TUI, not to --json".to_string());
     }
 
+    // The snapshot has its own interval flag. Two names for one interval would
+    // be worse than saying which one this mode reads.
+    if json && endpoints.sets_refresh() {
+        return Err(
+            "--refresh applies to the TUI; --json --watch <secs> sets the snapshot interval"
+                .to_string(),
+        );
+    }
+
     if json {
-        Ok(Cli::Json { watch })
+        Ok(Cli::Json { watch, endpoints })
     } else {
-        Ok(Cli::Tui { alerts })
+        Ok(Cli::Tui { alerts, endpoints })
     }
 }
 
@@ -123,6 +144,22 @@ fn print_help() {
     println!("    --alert-disk <pct>           Disk usage above pct");
     println!("    --alert-confirm <secs>       Hold time before a change counts (default 3)");
     println!("    --alert-cooldown <secs>      Gap between alerts for one threshold (default 300)");
+    println!();
+    println!("ENDPOINTS (defaults are the values that used to be hardcoded):");
+    println!("    --metrics-url <url>          Prometheus endpoint the monitor scrapes");
+    println!("                                 (default http://localhost:8889/metrics)");
+    println!("    --ws-url <url>               The node's WebSocket, for real-time blocks");
+    println!("                                 (default ws://localhost:8081)");
+    println!("    --refresh <secs>             Metrics scrape interval, TUI only (default 1)");
+    println!("    --network <name>             Network whose public node the block height is");
+    println!("                                 compared against (default mainnet)");
+    println!("    --external-rpc-url <url>     That comparison endpoint, given outright");
+    println!();
+    println!("CONFIG FILE (optional):");
+    println!("    ~/.config/monad-monitor/config.toml, or the same path under");
+    println!("    $XDG_CONFIG_HOME. Keys are the endpoint flags with underscores:");
+    println!("    metrics_url, ws_url, refresh, network, external_rpc_url. A flag beats");
+    println!("    the file, and the file beats the default.");
     println!();
     println!("The headless snapshot reuses the same data path as the TUI (metrics, RPC and");
     println!("system stats). In one-shot mode the exit status is non-zero when the node is");
@@ -146,15 +183,28 @@ async fn main() -> Result<()> {
             print_help();
             Ok(())
         }
-        Cli::Json { watch } => {
-            let code = snapshot::run(NETWORK, METRICS_ENDPOINT, RPC_ENDPOINT, watch).await?;
+        Cli::Json { watch, endpoints } => {
+            let code = snapshot::run(&settings(endpoints), watch).await?;
             std::process::exit(code);
         }
-        Cli::Tui { alerts } => run_tui(alerts).await,
+        Cli::Tui { alerts, endpoints } => run_tui(settings(endpoints), alerts).await,
     }
 }
 
-async fn run_tui(alert_config: AlertConfig) -> Result<()> {
+/// Merges the config file under the flags. A file that exists and does not
+/// parse stops the run: carrying on with the defaults would monitor localhost
+/// while the operator believes they configured a remote node.
+fn settings(endpoints: config::Layer) -> Config {
+    match config::load_file() {
+        Ok(file) => Config::resolve(file, endpoints),
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(2);
+        }
+    }
+}
+
+async fn run_tui(cfg: Config, alert_config: AlertConfig) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -163,7 +213,7 @@ async fn run_tui(alert_config: AlertConfig) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run app
-    let result = run_app(&mut terminal, alert_config).await;
+    let result = run_app(&mut terminal, cfg, alert_config).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -181,7 +231,11 @@ async fn run_tui(alert_config: AlertConfig) -> Result<()> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(terminal: &mut Terminal<B>, alert_config: AlertConfig) -> Result<()> {
+async fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    cfg: Config,
+    alert_config: AlertConfig,
+) -> Result<()> {
     let mut state = AppState::new();
 
     // One client for every webhook POST, and only when a webhook is configured.
@@ -195,7 +249,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, alert_config: AlertConf
 
     // Spawn RPC subscription (real-time block updates)
     let (rpc_tx, mut rpc_rx) = mpsc::channel::<RpcEvent>(100);
-    let rpc_client = RpcClient::new(RPC_ENDPOINT);
+    let rpc_client = RpcClient::new(&cfg.ws_url);
     rpc_client.subscribe(rpc_tx);
 
     // Forward RPC updates to main channel
@@ -208,31 +262,37 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, alert_config: AlertConf
 
     // Spawn background data fetcher for metrics (polling)
     let tx_metrics = tx.clone();
+    let metrics_url = cfg.metrics_url.clone();
+    let metrics_period = Duration::from_secs(cfg.refresh_secs);
     tokio::spawn(async move {
-        let metrics_client = MetricsClient::new(METRICS_ENDPOINT);
-        let mut refresh_interval = interval(Duration::from_millis(METRICS_REFRESH_INTERVAL_MS));
+        let metrics_client = MetricsClient::new(&metrics_url);
+        let mut refresh_interval = interval(metrics_period);
 
         loop {
             refresh_interval.tick().await;
-            let metrics_result = metrics_client.fetch().await;
-            let _ = tx_metrics.send(DataUpdate::Metrics(
-                metrics_result.map_err(|e| e.to_string())
-            )).await;
+            // The error names the endpoint: with the URL configurable,
+            // "Failed to fetch metrics" no longer says which one went quiet.
+            let result = metrics_client
+                .fetch()
+                .await
+                .map_err(|e| format!("{} ({})", e, metrics_client.endpoint()));
+            let _ = tx_metrics.send(DataUpdate::Metrics(result)).await;
         }
     });
 
     // Spawn background data fetcher for system data (less frequent)
     let tx_system = tx.clone();
+    let external_rpc_url = cfg.resolved_external_rpc_url();
     tokio::spawn(async move {
-        let mut system_client = SystemClient::new(NETWORK);
+        let mut system_client = SystemClient::new(&external_rpc_url);
         let mut refresh_interval = interval(Duration::from_millis(SYSTEM_REFRESH_INTERVAL_MS));
 
         loop {
             refresh_interval.tick().await;
             let system_result = system_client.fetch().await;
-            let _ = tx_system.send(DataUpdate::System(
-                system_result.map_err(|e| e.to_string())
-            )).await;
+            let _ = tx_system
+                .send(DataUpdate::System(system_result.map_err(|e| e.to_string())))
+                .await;
         }
     });
 
@@ -335,7 +395,8 @@ mod tests {
         assert_eq!(
             parse_args(&args(&[])).unwrap(),
             Cli::Tui {
-                alerts: AlertConfig::default()
+                alerts: AlertConfig::default(),
+                endpoints: config::Layer::default(),
             }
         );
     }
@@ -351,7 +412,7 @@ mod tests {
         .unwrap();
 
         match cli {
-            Cli::Tui { alerts } => {
+            Cli::Tui { alerts, .. } => {
                 assert_eq!(alerts.min_peers, Some(10));
                 assert_eq!(alerts.webhook_url.as_deref(), Some("https://example.com/hook"));
                 assert!(alerts.is_configured());
@@ -378,7 +439,10 @@ mod tests {
     fn json_flag_selects_snapshot() {
         assert_eq!(
             parse_args(&args(&["--json"])).unwrap(),
-            Cli::Json { watch: None }
+            Cli::Json {
+                watch: None,
+                endpoints: config::Layer::default(),
+            }
         );
     }
 
@@ -386,7 +450,10 @@ mod tests {
     fn json_with_watch_sets_interval() {
         assert_eq!(
             parse_args(&args(&["--json", "--watch", "5"])).unwrap(),
-            Cli::Json { watch: Some(5) }
+            Cli::Json {
+                watch: Some(5),
+                endpoints: config::Layer::default(),
+            }
         );
     }
 
@@ -411,5 +478,45 @@ mod tests {
     #[test]
     fn unknown_argument_is_rejected() {
         assert!(parse_args(&args(&["--nope"])).is_err());
+    }
+
+    #[test]
+    fn endpoint_flags_are_read_in_both_modes() {
+        let cli = parse_args(&args(&[
+            "--metrics-url",
+            "http://node:8889/metrics",
+            "--ws-url",
+            "ws://node:8081",
+        ]))
+        .unwrap();
+
+        let endpoints = match cli {
+            Cli::Tui { endpoints, .. } => endpoints,
+            other => panic!("expected the TUI, got {:?}", other),
+        };
+        let cfg = Config::resolve(config::Layer::default(), endpoints);
+        assert_eq!(cfg.metrics_url, "http://node:8889/metrics");
+        assert_eq!(cfg.ws_url, "ws://node:8081");
+
+        // The snapshot reads the same endpoints, so pointing --json at a
+        // remote node does not need a second set of flags.
+        assert!(parse_args(&args(&["--json", "--ws-url", "ws://node:8081"])).is_ok());
+    }
+
+    #[test]
+    fn a_mistyped_endpoint_flag_is_rejected_rather_than_ignored() {
+        // Accepting these quietly would leave the monitor on localhost while
+        // the operator believes it is watching another host.
+        assert!(parse_args(&args(&["--metrics_url", "http://node:8889/metrics"])).is_err());
+        assert!(parse_args(&args(&["--metrics-url"])).is_err());
+        assert!(parse_args(&args(&["--ws-url", "http://node:8081"])).is_err());
+    }
+
+    #[test]
+    fn refresh_is_rejected_in_snapshot_mode() {
+        assert!(parse_args(&args(&["--refresh", "5"])).is_ok());
+        // --watch is the snapshot's interval, so taking --refresh here and
+        // ignoring it would look like it had been set.
+        assert!(parse_args(&args(&["--json", "--refresh", "5"])).is_err());
     }
 }

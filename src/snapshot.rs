@@ -13,6 +13,7 @@ use anyhow::Result;
 use serde::Serialize;
 use tokio::time::timeout;
 
+use crate::config::Config;
 use crate::metrics::{MetricsClient, PrometheusMetrics};
 use crate::rpc::RpcClient;
 use crate::state::AppState;
@@ -111,15 +112,10 @@ async fn collect(
 /// Run the headless mode. With `watch = None` it prints one snapshot and
 /// returns an exit code (0 reachable, 1 unreachable). With `watch = Some(secs)`
 /// it prints one JSON object per interval as NDJSON and runs until interrupted.
-pub async fn run(
-    network: &str,
-    metrics_endpoint: &str,
-    rpc_endpoint: &str,
-    watch: Option<u64>,
-) -> Result<i32> {
-    let metrics = MetricsClient::new(metrics_endpoint);
-    let mut system = SystemClient::new(network);
-    let rpc = RpcClient::new(rpc_endpoint);
+pub async fn run(cfg: &Config, watch: Option<u64>) -> Result<i32> {
+    let metrics = MetricsClient::new(&cfg.metrics_url);
+    let mut system = SystemClient::new(&cfg.resolved_external_rpc_url());
+    let rpc = RpcClient::new(&cfg.ws_url);
     let mut state = AppState::new();
 
     match watch {
@@ -130,7 +126,7 @@ pub async fn run(
             tokio::time::sleep(Duration::from_secs(1)).await;
             let reachable = collect(&mut state, &metrics, &mut system, &rpc).await;
 
-            let snap = Snapshot::from_state(&state, network, reachable);
+            let snap = Snapshot::from_state(&state, &cfg.network, reachable);
             println!("{}", serde_json::to_string(&snap)?);
             Ok(if reachable { 0 } else { 1 })
         }
@@ -144,7 +140,7 @@ pub async fn run(
             loop {
                 ticker.tick().await;
                 let reachable = collect(&mut state, &metrics, &mut system, &rpc).await;
-                let snap = Snapshot::from_state(&state, network, reachable);
+                let snap = Snapshot::from_state(&state, &cfg.network, reachable);
                 let line = serde_json::to_string(&snap)?;
                 let mut handle = stdout.lock();
                 // If stdout is gone (piped into a closed reader), stop quietly.

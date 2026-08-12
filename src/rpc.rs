@@ -117,7 +117,7 @@ impl RpcClient {
     pub async fn fetch_once(&self) -> Result<RpcData> {
         let (ws_stream, _) = connect_async(&self.endpoint)
             .await
-            .context("Failed to connect to WebSocket")?;
+            .with_context(|| format!("Failed to connect to {}", self.endpoint))?;
         let (mut write, mut read) = ws_stream.split();
 
         let mut data = RpcData::default();
@@ -181,7 +181,7 @@ impl RpcClient {
 async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result<bool> {
     let (ws_stream, _) = connect_async(endpoint)
         .await
-        .context("Failed to connect to WebSocket")?;
+        .with_context(|| format!("Failed to connect to {}", endpoint))?;
 
     let (mut write, mut read) = ws_stream.split();
 
