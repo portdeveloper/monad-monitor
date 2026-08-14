@@ -142,7 +142,9 @@ impl RpcClient {
             },
         ];
         for req in &requests {
-            write.send(Message::Text(serde_json::to_string(req)?)).await?;
+            write
+                .send(Message::Text(serde_json::to_string(req)?))
+                .await?;
         }
 
         let mut responses: HashMap<u32, Value> = HashMap::new();
@@ -263,7 +265,9 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result
         params: json!(["newHeads"]),
         id: 999,
     };
-    write.send(Message::Text(serde_json::to_string(&subscribe_req)?)).await?;
+    write
+        .send(Message::Text(serde_json::to_string(&subscribe_req)?))
+        .await?;
 
     // Past this point the connection is established and streaming, which is
     // what the caller needs to know to reset its reconnect delay.
@@ -323,7 +327,9 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result
                                     params: json!([hex_num, false]),
                                     id: (number % 100000) as u32 + 10000,
                                 };
-                                write.send(Message::Text(serde_json::to_string(&block_req)?)).await?;
+                                write
+                                    .send(Message::Text(serde_json::to_string(&block_req)?))
+                                    .await?;
 
                                 // Also fetch gas price periodically
                                 let gas_req = JsonRpcRequest {
@@ -332,7 +338,9 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result
                                     params: json!([]),
                                     id: 1001,
                                 };
-                                write.send(Message::Text(serde_json::to_string(&gas_req)?)).await?;
+                                write
+                                    .send(Message::Text(serde_json::to_string(&gas_req)?))
+                                    .await?;
 
                                 // Send update immediately
                                 let _ = tx.send(RpcEvent::Data(data.clone())).await;
@@ -348,7 +356,11 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result
                                 .map(|arr| arr.len())
                                 .unwrap_or(0);
                             // Find the block with matching number suffix
-                            if let Some(block) = data.recent_blocks.iter_mut().find(|b| b.number % 100000 == block_num_suffix) {
+                            if let Some(block) = data
+                                .recent_blocks
+                                .iter_mut()
+                                .find(|b| b.number % 100000 == block_num_suffix)
+                            {
                                 block.tx_count = tx_count;
                             }
                             let _ = tx.send(RpcEvent::Data(data.clone())).await;
@@ -399,7 +411,10 @@ where
     R: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
     <S as futures::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Send all block requests
+    // Send all block requests. Only a request that actually went out gets a
+    // reply, so the expected count follows the sends: waiting on a request
+    // that failed to send is waiting on a reply that was never asked for.
+    let mut expected = 0;
     for i in 0..count {
         let block_num = start_block.saturating_sub(i as u64);
         let hex_num = format!("0x{:x}", block_num);
@@ -409,7 +424,13 @@ where
             params: json!([hex_num, false]),
             id: 100 + i,
         };
-        write.send(Message::Text(serde_json::to_string(&req)?)).await.ok();
+        if write
+            .send(Message::Text(serde_json::to_string(&req)?))
+            .await
+            .is_ok()
+        {
+            expected += 1;
+        }
     }
 
     // Collect responses. One request going unanswered used to hang the whole
@@ -417,12 +438,19 @@ where
     // else and gives up to the reconnect path if the node stops replying.
     let mut block_responses: HashMap<u32, Value> = HashMap::new();
     let mut received = 0;
-    while received < count {
+    while received < expected {
         if let Message::Text(text) = read_message(read, HANDSHAKE_TIMEOUT).await? {
             if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
-                if let (Some(id), Some(result)) = (resp.id, resp.result) {
-                    if id >= 100 && id < 100 + count {
-                        block_responses.insert(id, result);
+                if let Some(id) = resp.id {
+                    if (100..100 + count).contains(&id) {
+                        // A null result is still an answer: the node has no
+                        // such block (pruned history, or a chain shorter than
+                        // the window). The block is skipped, not waited for
+                        // again — treating it as unanswered is what used to
+                        // tear the whole connection down and retry forever.
+                        if let Some(result) = resp.result {
+                            block_responses.insert(id, result);
+                        }
                         received += 1;
                     }
                 }
@@ -442,18 +470,9 @@ where
                     .as_array()
                     .map(|arr| arr.len())
                     .unwrap_or(0),
-                timestamp: result["timestamp"]
-                    .as_str()
-                    .map(parse_hex_u64)
-                    .unwrap_or(0),
-                gas_used: result["gasUsed"]
-                    .as_str()
-                    .map(parse_hex_u64)
-                    .unwrap_or(0),
-                gas_limit: result["gasLimit"]
-                    .as_str()
-                    .map(parse_hex_u64)
-                    .unwrap_or(0),
+                timestamp: result["timestamp"].as_str().map(parse_hex_u64).unwrap_or(0),
+                gas_used: result["gasUsed"].as_str().map(parse_hex_u64).unwrap_or(0),
+                gas_limit: result["gasLimit"].as_str().map(parse_hex_u64).unwrap_or(0),
             });
         }
     }
@@ -464,4 +483,153 @@ where
 fn parse_hex_u64(hex: &str) -> u64 {
     let hex = hex.trim_start_matches("0x");
     u64::from_str_radix(hex, 16).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+
+    /// A sink that accepts the first `succeed` sends and refuses the rest, so
+    /// a test can drive `fetch_blocks` through send failures without a socket.
+    struct MockSink {
+        sent: usize,
+        succeed: usize,
+    }
+
+    impl MockSink {
+        fn accepting_all() -> Self {
+            Self {
+                sent: 0,
+                succeed: usize::MAX,
+            }
+        }
+
+        fn accepting(succeed: usize) -> Self {
+            Self { sent: 0, succeed }
+        }
+    }
+
+    impl futures::Sink<Message> for MockSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            let index = self.sent;
+            self.sent += 1;
+            if index < self.succeed {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "send failed",
+                ))
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The wire messages a node would send back, as a finished stream. If the
+    /// code under test tries to read past the end, `read_message` reports the
+    /// connection closed and the test fails, which is exactly the regression
+    /// being guarded against: waiting for replies that are never coming.
+    fn replies(
+        texts: Vec<String>,
+    ) -> impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin {
+        futures::stream::iter(
+            texts
+                .into_iter()
+                .map(|t| Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Text(t))),
+        )
+    }
+
+    fn block_reply(id: u32) -> String {
+        format!(
+            r#"{{"id":{},"result":{{"hash":"0xabc","transactions":["0x1","0x2"],"timestamp":"0x0","gasUsed":"0x5","gasLimit":"0x64"}}}}"#,
+            id
+        )
+    }
+
+    fn null_reply(id: u32) -> String {
+        format!(r#"{{"id":{},"result":null}}"#, id)
+    }
+
+    #[tokio::test]
+    async fn a_null_result_counts_as_answered_and_the_block_is_skipped() {
+        let mut write = MockSink::accepting_all();
+        // Blocks 200 and 198 exist; 199 is pruned and answers null. The stream
+        // holds exactly three replies, so completing at all proves nothing
+        // waited on a fourth.
+        let mut read = replies(vec![block_reply(100), null_reply(101), block_reply(102)]);
+
+        let blocks = fetch_blocks(&mut write, &mut read, 200, 3).await.unwrap();
+
+        let numbers: Vec<u64> = blocks.iter().map(|b| b.number).collect();
+        assert_eq!(numbers, vec![200, 198]);
+    }
+
+    #[tokio::test]
+    async fn every_block_missing_still_comes_back_rather_than_erroring() {
+        // A freshly started chain can be shorter than the whole window. The
+        // backfill returns empty and the caller carries on to the
+        // subscription, instead of tearing the connection down.
+        let mut write = MockSink::accepting_all();
+        let mut read = replies(vec![null_reply(100), null_reply(101), null_reply(102)]);
+
+        let blocks = fetch_blocks(&mut write, &mut read, 2, 3).await.unwrap();
+        assert!(blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_is_not_waited_for() {
+        // Only the first request goes out, so only one reply exists. Expecting
+        // three would leave the loop reading a stream with nothing left.
+        let mut write = MockSink::accepting(1);
+        let mut read = replies(vec![block_reply(100)]);
+
+        let blocks = fetch_blocks(&mut write, &mut read, 200, 3).await.unwrap();
+
+        let numbers: Vec<u64> = blocks.iter().map(|b| b.number).collect();
+        assert_eq!(numbers, vec![200]);
+    }
+
+    #[tokio::test]
+    async fn replies_out_of_order_and_interleaved_noise_still_land() {
+        // Subscription notifications and unrelated ids arrive mixed into the
+        // backfill replies on a real socket; none of them may count toward the
+        // expected total or the loop finishes early.
+        let mut write = MockSink::accepting_all();
+        let mut read = replies(vec![
+            r#"{"method":"eth_subscription","params":{"result":{}}}"#.to_string(),
+            block_reply(101),
+            r#"{"id":999,"result":"0xdeadbeef"}"#.to_string(),
+            null_reply(100),
+        ]);
+
+        let blocks = fetch_blocks(&mut write, &mut read, 200, 2).await.unwrap();
+
+        let numbers: Vec<u64> = blocks.iter().map(|b| b.number).collect();
+        assert_eq!(numbers, vec![199]);
+        assert_eq!(blocks[0].tx_count, 2);
+    }
 }
