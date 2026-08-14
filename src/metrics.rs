@@ -45,6 +45,11 @@ impl MetricsClient {
         }
     }
 
+    /// The URL being scraped, so an error can name the endpoint it tried.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub async fn fetch(&self) -> Result<PrometheusMetrics> {
         let body = self
             .client

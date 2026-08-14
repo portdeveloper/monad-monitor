@@ -106,16 +106,18 @@ struct CpuTimes {
 }
 
 pub struct SystemClient {
-    network: String,
+    /// The public node the local block height is compared against. The config
+    /// layer resolves it, so this never has to know about network names.
+    external_rpc_url: String,
     /// The previous CPU reading, held so each sample can be compared with the
     /// one before it.
     cpu_prev: Option<CpuTimes>,
 }
 
 impl SystemClient {
-    pub fn new(network: &str) -> Self {
+    pub fn new(external_rpc_url: &str) -> Self {
         Self {
-            network: network.to_string(),
+            external_rpc_url: external_rpc_url.to_string(),
             cpu_prev: None,
         }
     }
@@ -178,10 +180,14 @@ impl SystemClient {
     }
 
     async fn fetch_external_block(&self) -> Result<u64> {
-        let url = format!("wss://rpc-{}.monadinfra.com", self.network);
-        let (ws_stream, _) = connect_async(&url)
+        let (ws_stream, _) = connect_async(&self.external_rpc_url)
             .await
-            .context("Failed to connect to external WebSocket")?;
+            .with_context(|| {
+                format!(
+                    "Failed to connect to external WebSocket {}",
+                    self.external_rpc_url
+                )
+            })?;
 
         let (mut write, mut read) = ws_stream.split();
 

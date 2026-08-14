@@ -41,7 +41,7 @@ cargo run
 To see real data you need a Monad node exposing:
 
 - Prometheus metrics on `http://localhost:8889/metrics`
-- A WebSocket endpoint on `ws://localhost:8080` (see the [Monad events and WebSockets docs](https://docs.monad.xyz/node-ops/events-and-websockets))
+- A WebSocket endpoint on `ws://localhost:8081` (see the [Monad events and WebSockets docs](https://docs.monad.xyz/node-ops/events-and-websockets))
 
 ## How to contribute
 
