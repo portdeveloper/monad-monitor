@@ -57,6 +57,8 @@ enum Cli {
     },
     /// Print usage and exit.
     Help,
+    /// Print the version and exit.
+    Version,
 }
 
 fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
@@ -81,6 +83,7 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
                 }
             }
             "-h" | "--help" => return Ok(Cli::Help),
+            "-V" | "--version" => return Ok(Cli::Version),
             flag if alerts::is_alert_flag(flag) => {
                 i += 1;
                 let value = args
@@ -135,6 +138,7 @@ fn print_help() {
     println!("    monad-monitor --json                 Print one JSON snapshot and exit");
     println!("    monad-monitor --json --watch <secs>  Print a JSON object every <secs> (NDJSON)");
     println!("    monad-monitor --help                 Show this help");
+    println!("    monad-monitor --version              Print the version and exit");
     println!();
     println!("ALERTS (TUI only, off unless configured):");
     println!("    --webhook-url <url>          POST a JSON payload here on each transition");
@@ -181,6 +185,10 @@ async fn main() -> Result<()> {
     match cli {
         Cli::Help => {
             print_help();
+            Ok(())
+        }
+        Cli::Version => {
+            println!("monad-monitor {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Cli::Json { watch, endpoints } => {
@@ -461,6 +469,12 @@ mod tests {
     fn help_is_recognized() {
         assert_eq!(parse_args(&args(&["--help"])).unwrap(), Cli::Help);
         assert_eq!(parse_args(&args(&["-h"])).unwrap(), Cli::Help);
+    }
+
+    #[test]
+    fn version_is_recognized() {
+        assert_eq!(parse_args(&args(&["--version"])).unwrap(), Cli::Version);
+        assert_eq!(parse_args(&args(&["-V"])).unwrap(), Cli::Version);
     }
 
     #[test]
