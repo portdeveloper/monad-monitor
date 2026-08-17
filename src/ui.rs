@@ -500,8 +500,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState, label_color: Col
             };
 
             let age = if b.timestamp > 0 && now_ts >= b.timestamp {
-                let secs = now_ts - b.timestamp;
-                format!("{}s ago", secs)
+                format_age(now_ts - b.timestamp)
             } else {
                 "...".to_string()
             };
@@ -770,4 +769,71 @@ fn format_number(n: u64) -> String {
         result.insert(0, c);
     }
     result
+}
+
+/// Renders a block's age the way `uptime_since_restart` renders uptime:
+/// seconds under a minute, minutes under an hour, then hours with minutes.
+/// Every form fits the AGE column, which is `Constraint::Length(10)` — from
+/// ten hours the minutes are dropped, or "12h 30m ago" would be the one
+/// rendering an 11th character.
+fn format_age(secs: u64) -> String {
+    let mins = secs / 60;
+    let hours = mins / 60;
+
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if mins < 60 {
+        format!("{}m ago", mins)
+    } else if hours < 10 {
+        format!("{}h {}m ago", hours, mins % 60)
+    } else {
+        format!("{}h ago", hours)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ages_under_a_minute_keep_the_seconds_form() {
+        assert_eq!(format_age(0), "0s ago");
+        assert_eq!(format_age(59), "59s ago");
+    }
+
+    #[test]
+    fn minutes_take_over_at_sixty_seconds() {
+        assert_eq!(format_age(60), "1m ago");
+        assert_eq!(format_age(847), "14m ago");
+        assert_eq!(format_age(3599), "59m ago");
+    }
+
+    #[test]
+    fn hours_carry_their_minutes() {
+        assert_eq!(format_age(3600), "1h 0m ago");
+        assert_eq!(format_age(3660), "1h 1m ago");
+        assert_eq!(format_age(35940), "9h 59m ago");
+    }
+
+    #[test]
+    fn from_ten_hours_the_minutes_are_dropped_to_stay_in_the_column() {
+        assert_eq!(format_age(36000), "10h ago");
+        assert_eq!(format_age(90000), "25h ago");
+    }
+
+    #[test]
+    fn every_rendering_fits_the_age_column() {
+        // The column is Constraint::Length(10). Sweep the boundaries of every
+        // format branch; a form that renders an 11th character would be
+        // silently truncated by the table instead of failing anywhere.
+        for secs in [0, 59, 60, 3599, 3600, 35940, 35999, 36000, 863940] {
+            let rendered = format_age(secs);
+            assert!(
+                rendered.len() <= 10,
+                "{:?} is {} chars",
+                rendered,
+                rendered.len()
+            );
+        }
+    }
 }
