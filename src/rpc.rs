@@ -148,12 +148,23 @@ impl RpcClient {
         }
 
         let mut responses: HashMap<u32, Value> = HashMap::new();
-        while responses.len() < requests.len() {
+        let mut received = 0;
+        while received < requests.len() {
             match read.next().await {
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
-                        if let (Some(id), Some(result)) = (resp.id, resp.result) {
-                            responses.insert(id, result);
+                        if let Some(id) = resp.id {
+                            if (id as usize) < requests.len() {
+                                // An error reply is an answer: that value stays
+                                // at its default in the snapshot. Waiting for a
+                                // result the node has declined would burn the
+                                // whole timeout and report a healthy node
+                                // unreachable.
+                                if let Some(result) = resp.result {
+                                    responses.insert(id, result);
+                                }
+                                received += 1;
+                            }
                         }
                     }
                 }
@@ -217,21 +228,12 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result
         write.send(Message::Text(text)).await?;
     }
 
-    // Collect initial responses. A node that answers some of these and then
-    // goes quiet used to leave this loop waiting forever; the timeout turns
-    // that into a reconnect instead.
-    let mut responses: HashMap<u32, Value> = HashMap::new();
-    let mut received = 0;
-    while received < 3 {
-        if let Message::Text(text) = read_message(&mut read, HANDSHAKE_TIMEOUT).await? {
-            if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
-                if let (Some(id), Some(result)) = (resp.id, resp.result) {
-                    responses.insert(id, result);
-                    received += 1;
-                }
-            }
-        }
-    }
+    // Collect the handshake replies. A node that answers some of these and
+    // then goes quiet used to leave this loop waiting forever; the timeout
+    // turns that into a reconnect instead. An error reply counts as answered —
+    // a node that declines one of these calls can still stream blocks, and
+    // that is the job.
+    let responses = collect_replies(&mut read, initial_requests.len() as u32).await?;
 
     // Parse initial data
     if let Some(result) = responses.get(&0) {
@@ -381,6 +383,38 @@ async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result
     }
 
     Ok(true)
+}
+
+/// Collects one reply for each request id below `expected` and returns the
+/// results by id.
+///
+/// A reply is counted whether it carries a result or an error: an error is
+/// still an answer, and holding out for a value the node has declined to
+/// produce is what used to park the whole subscription until the timeout tore
+/// it down. An id that ends up absent from the map simply leaves its value at
+/// the caller's default. Unrelated traffic (subscription notifications,
+/// foreign ids) does not count toward the total.
+async fn collect_replies<R>(read: &mut R, expected: u32) -> Result<HashMap<u32, Value>>
+where
+    R: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let mut responses: HashMap<u32, Value> = HashMap::new();
+    let mut received = 0;
+    while received < expected {
+        if let Message::Text(text) = read_message(read, HANDSHAKE_TIMEOUT).await? {
+            if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
+                if let Some(id) = resp.id {
+                    if id < expected {
+                        if let Some(result) = resp.result {
+                            responses.insert(id, result);
+                        }
+                        received += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(responses)
 }
 
 /// Reads one frame, or fails. Every wait on the socket goes through here so a
@@ -572,6 +606,59 @@ mod tests {
 
     fn null_reply(id: u32) -> String {
         format!(r#"{{"id":{},"result":null}}"#, id)
+    }
+
+    #[tokio::test]
+    async fn an_error_reply_counts_as_answered_and_leaves_its_value_absent() {
+        // The handshake ids are 0, 1, 2. Id 1 answers with a JSON-RPC error;
+        // the stream holds exactly three replies, so completing at all proves
+        // the error was counted rather than waited out.
+        let mut read = replies(vec![
+            r#"{"id":0,"result":"0x64"}"#.to_string(),
+            r#"{"id":1,"error":{"code":-32601,"message":"eth_gasPrice is not available"}}"#
+                .to_string(),
+            r#"{"id":2,"result":"MockNode/0.1"}"#.to_string(),
+        ]);
+
+        let responses = collect_replies(&mut read, 3).await.unwrap();
+
+        assert_eq!(responses.get(&0).and_then(|v| v.as_str()), Some("0x64"));
+        assert!(responses.get(&1).is_none());
+        assert_eq!(
+            responses.get(&2).and_then(|v| v.as_str()),
+            Some("MockNode/0.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_traffic_does_not_count_toward_the_handshake() {
+        // A subscription notification and a foreign id arrive mixed in; if
+        // either counted, the loop would finish before the real replies.
+        let mut read = replies(vec![
+            r#"{"method":"eth_subscription","params":{"result":{}}}"#.to_string(),
+            r#"{"id":0,"result":"0x64"}"#.to_string(),
+            r#"{"id":999,"result":"0xdeadbeef"}"#.to_string(),
+            r#"{"id":1,"result":null}"#.to_string(),
+            r#"{"id":2,"result":"MockNode/0.1"}"#.to_string(),
+        ]);
+
+        let responses = collect_replies(&mut read, 3).await.unwrap();
+
+        assert_eq!(responses.len(), 2);
+        assert!(responses.get(&999).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stream_ending_short_of_the_handshake_is_an_error() {
+        // Two replies and then the connection is gone. That is a dead
+        // handshake, and the caller reconnects; pretending it completed would
+        // bring the subscription up on half-initialised data.
+        let mut read = replies(vec![
+            r#"{"id":0,"result":"0x64"}"#.to_string(),
+            r#"{"id":2,"result":"MockNode/0.1"}"#.to_string(),
+        ]);
+
+        assert!(collect_replies(&mut read, 3).await.is_err());
     }
 
     #[tokio::test]
