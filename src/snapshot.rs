@@ -37,7 +37,9 @@ pub struct Snapshot {
     pub tps_peak: f64,
     pub peer_health: String,
     pub finalized_lag: u64,
-    pub block_difference: i64,
+    /// `null` when the public node could not be reached, so a script can tell
+    /// "no difference" apart from "no comparison".
+    pub block_difference: Option<i64>,
     pub all_services_running: bool,
     pub gas_price_gwei: f64,
     pub client_version: String,
@@ -199,6 +201,28 @@ mod tests {
         assert_eq!(v["disk_used_pct"], 42.5);
         // derived and lifted to the top level
         assert_eq!(v["finalized_lag"], 2);
+    }
+
+    #[test]
+    fn an_unreachable_external_node_leaves_the_difference_null() {
+        let mut state = AppState::new();
+        state.update_system(SystemData {
+            external_block: None,
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert!(v["block_difference"].is_null());
+
+        state.update_system(SystemData {
+            external_block: Some(120),
+            ..Default::default()
+        });
+        state.update_rpc(RpcData {
+            block_number: 100,
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(v["block_difference"], 20);
     }
 
     #[test]

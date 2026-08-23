@@ -224,21 +224,23 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
     // Block height with block difference
     let block_num = state.block_height();
     let sync_status = state.sync_status();
+    // Without a reading from the public node there is nothing to compare
+    // against, so the colour falls back to what the node says about its own
+    // sync rather than to the verdict a zero difference would imply.
     let block_diff = state.system.block_difference(block_num);
-    let sync_color = if sync_status == "synced" && block_diff.abs() < 5 {
-        Color::Green
-    } else if block_diff.abs() < 20 {
-        Color::Yellow
-    } else {
-        Color::Red
+    let sync_color = match block_diff {
+        Some(diff) if sync_status == "synced" && diff.abs() < 5 => Color::Green,
+        Some(diff) if diff.abs() < 20 => Color::Yellow,
+        Some(_) => Color::Red,
+        None if sync_status == "synced" => Color::Green,
+        None => Color::Yellow,
     };
 
-    let diff_str = if block_diff == 0 {
-        "Δ0".to_string()
-    } else if block_diff > 0 {
-        format!("Δ-{}", block_diff)
-    } else {
-        format!("Δ+{}", block_diff.abs())
+    let diff_str = match block_diff {
+        Some(0) => "Δ0".to_string(),
+        Some(diff) if diff > 0 => format!("Δ-{}", diff),
+        Some(diff) => format!("Δ+{}", diff.abs()),
+        None => "Δ?".to_string(),
     };
 
     let block_text = vec![
