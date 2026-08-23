@@ -4,7 +4,14 @@ use serde::Serialize;
 use serde_json::json;
 use std::fs;
 use std::process::Command;
+use std::time::Duration;
+use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+/// How long the comparison against the public node may take, connect and read
+/// together. It sits inside the system refresh, so a stalled endpoint costs one
+/// unknown reading rather than every system stat behind it.
+const EXTERNAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Data from system commands (monad-mpt, systemctl, external RPC)
 #[derive(Debug, Clone, Default, Serialize)]
@@ -24,8 +31,10 @@ pub struct SystemData {
     pub service_execution: bool,
     pub service_rpc: bool,
 
-    // External block for comparison
-    pub external_block: u64,
+    /// The public node's height, for the comparison in the header. `None` when
+    /// that endpoint could not be reached in time: unknown is a state of its
+    /// own, and reporting it as zero reads on screen as "no difference".
+    pub external_block: Option<u64>,
 
     // System resources
     pub memory_used_pct: f64,
@@ -48,12 +57,8 @@ pub struct SystemData {
 }
 
 impl SystemData {
-    pub fn block_difference(&self, local_block: u64) -> i64 {
-        if self.external_block == 0 {
-            0
-        } else {
-            self.external_block as i64 - local_block as i64
-        }
+    pub fn block_difference(&self, local_block: u64) -> Option<i64> {
+        Some(self.external_block? as i64 - local_block as i64)
     }
 
     pub fn finalized_lag(&self) -> u64 {
@@ -145,10 +150,14 @@ impl SystemClient {
             data.service_started_at = services.3;
         }
 
-        // Fetch external block number
-        if let Ok(block) = self.fetch_external_block().await {
-            data.external_block = block;
-        }
+        // Fetch external block number. This is the one reading that depends on
+        // a host neither the operator nor this monitor controls, so it is kept
+        // on a leash: an endpoint that accepts the connection and then says
+        // nothing must not take the rest of the fetch down with it.
+        data.external_block = timeout(EXTERNAL_TIMEOUT, self.fetch_external_block())
+            .await
+            .ok()
+            .and_then(|result| result.ok());
 
         // Fetch system resources (blocking, but fast)
         if let Ok(resources) = tokio::task::spawn_blocking(fetch_system_resources).await {
@@ -207,19 +216,28 @@ impl SystemClient {
             match msg {
                 Ok(Message::Text(text)) => {
                     let response: serde_json::Value = serde_json::from_str(&text)?;
-                    if let Some(hex) = response["result"].as_str() {
-                        let hex = hex.trim_start_matches("0x");
-                        return Ok(u64::from_str_radix(hex, 16).unwrap_or(0));
-                    }
-                    return Ok(0);
+                    let hex = response["result"]
+                        .as_str()
+                        .context("External node did not answer eth_blockNumber with a height")?;
+                    return parse_hex_block(hex);
                 }
                 Ok(Message::Close(_)) => break,
                 Err(_) => break,
                 _ => continue,
             }
         }
-        Ok(0)
+        anyhow::bail!("External node closed the connection before answering")
     }
+}
+
+/// Reads the hex block number out of an `eth_blockNumber` reply. A value that
+/// does not parse is refused rather than turned into zero, so a malformed reply
+/// leaves the comparison unknown instead of claiming the public node is at
+/// genesis.
+fn parse_hex_block(hex: &str) -> Result<u64> {
+    let digits = hex.strip_prefix("0x").unwrap_or(hex);
+    u64::from_str_radix(digits, 16)
+        .with_context(|| format!("Unreadable block number from external node: {}", hex))
 }
 
 /// Returns (bft_active, execution_active, rpc_active, started_at_timestamp)
@@ -705,5 +723,37 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn the_difference_is_signed_against_the_external_height() {
+        let data = SystemData {
+            external_block: Some(1000),
+            ..Default::default()
+        };
+        assert_eq!(data.block_difference(1000), Some(0));
+        assert_eq!(data.block_difference(994), Some(6));
+        assert_eq!(data.block_difference(1003), Some(-3));
+    }
+
+    #[test]
+    fn without_an_external_height_there_is_no_difference_to_report() {
+        let data = SystemData::default();
+        assert_eq!(data.external_block, None);
+        assert_eq!(data.block_difference(1000), None);
+    }
+
+    #[test]
+    fn a_block_number_is_read_with_or_without_the_prefix() {
+        assert_eq!(parse_hex_block("0x3e8").unwrap(), 1000);
+        assert_eq!(parse_hex_block("3e8").unwrap(), 1000);
+        assert_eq!(parse_hex_block("0x0").unwrap(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_block_number_is_refused_rather_than_zeroed() {
+        assert!(parse_hex_block("0x").is_err());
+        assert!(parse_hex_block("latest").is_err());
+        assert!(parse_hex_block("").is_err());
     }
 }
