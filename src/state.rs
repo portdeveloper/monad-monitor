@@ -44,6 +44,11 @@ pub struct AppState {
     pub last_block_time: Option<Instant>,
     last_block_number: u64,
 
+    // Metrics polls in a row that brought no new TPS sample. Once a full
+    // window's worth pass without one, the window describes the past, not the
+    // present, and the rate decays to zero instead of replaying its last value.
+    polls_since_sample: u32,
+
     // When the node's WebSocket last delivered a block, and whether the
     // subscription is up. Kept apart from `last_block_time`, which the metrics
     // poll also refreshes: a dead WebSocket has to stay visible even while
@@ -105,6 +110,7 @@ impl AppState {
             last_update: Instant::now(),
             last_block_time: None,
             last_block_number: 0,
+            polls_since_sample: 0,
             last_rpc_block_at: None,
             ws_connected: false,
             ws_error: None,
@@ -153,6 +159,7 @@ impl AppState {
         }
 
         // Add TX sample for TPS calculation
+        let mut sampled = false;
         if metrics.tx_commits_timestamp_ms > 0 {
             let sample = TxSample {
                 tx_commits: metrics.tx_commits,
@@ -170,11 +177,26 @@ impl AppState {
                 if self.tx_samples.len() > SAMPLE_HISTORY_SIZE {
                     self.tx_samples.pop_front();
                 }
+                sampled = true;
             }
         }
 
-        // Calculate TPS from samples
-        self.calculate_tps();
+        if sampled {
+            self.polls_since_sample = 0;
+            self.calculate_tps();
+        } else {
+            // The counter's clock did not move, so recomputing from the same
+            // window would only repeat the old rate. A short gap keeps the last
+            // reading; a window's worth of empty polls means the source stopped
+            // and the rate follows it down.
+            self.polls_since_sample = self.polls_since_sample.saturating_add(1);
+            if self.polls_since_sample as usize >= SAMPLE_HISTORY_SIZE {
+                self.tps_prev = self.tps;
+                self.tps = 0.0;
+                self.tx_samples.clear();
+            }
+            self.push_tps_point();
+        }
 
         // Track latency and peers for trend
         self.latency_prev = self.metrics.latency_p99_ms;
@@ -274,12 +296,16 @@ impl AppState {
                 self.tps_peak = self.tps;
             }
 
-            // Add to history for sparkline (capped at reasonable value for display)
-            let tps_capped = (self.tps.min(10000.0)) as u64;
-            self.tps_history.push_back(tps_capped);
-            if self.tps_history.len() > TPS_HISTORY_SIZE {
-                self.tps_history.pop_front();
-            }
+            self.push_tps_point();
+        }
+    }
+
+    // Add to history for sparkline (capped at reasonable value for display)
+    fn push_tps_point(&mut self) {
+        let tps_capped = (self.tps.min(10000.0)) as u64;
+        self.tps_history.push_back(tps_capped);
+        if self.tps_history.len() > TPS_HISTORY_SIZE {
+            self.tps_history.pop_front();
         }
     }
 
@@ -292,6 +318,13 @@ impl AppState {
     }
 
     pub fn block_height(&self) -> u64 {
+        // The WebSocket's height leads while the subscription is up. Once it
+        // drops, that number only ages, and the metrics poll is still
+        // reporting; taking the higher of the two keeps the header moving
+        // instead of frozen at the moment the stream died.
+        if !self.ws_connected {
+            return self.rpc_data.block_number.max(self.metrics.block_num);
+        }
         // Prefer RPC block number as it's more accurate
         if self.rpc_data.block_number > 0 {
             self.rpc_data.block_number
@@ -387,5 +420,84 @@ impl AppState {
         } else {
             format!("{:.0}B/s", bytes_per_sec)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::PrometheusMetrics;
+    use crate::rpc::RpcData;
+
+    fn metrics_at(commits: u64, ts_ms: u64) -> PrometheusMetrics {
+        PrometheusMetrics {
+            tx_commits: commits,
+            tx_commits_timestamp_ms: ts_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_brief_gap_keeps_the_last_rate() {
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(0, 1_000));
+        state.update_metrics(metrics_at(500, 2_000));
+        let live = state.tps;
+        assert!(live > 0.0);
+
+        state.update_metrics(metrics_at(500, 2_000));
+        assert_eq!(state.tps, live);
+    }
+
+    #[test]
+    fn tps_decays_to_zero_when_the_counter_stops() {
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(0, 1_000));
+        state.update_metrics(metrics_at(500, 2_000));
+        state.update_metrics(metrics_at(1_000, 3_000));
+        assert!(state.tps > 0.0);
+
+        // The same frozen reading for a full window's worth of polls.
+        for _ in 0..SAMPLE_HISTORY_SIZE {
+            state.update_metrics(metrics_at(1_000, 3_000));
+        }
+        assert_eq!(state.tps, 0.0);
+        assert_eq!(state.tps_sparkline_data().last(), Some(&0));
+    }
+
+    #[test]
+    fn tps_comes_back_when_the_counter_resumes() {
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(0, 1_000));
+        state.update_metrics(metrics_at(500, 2_000));
+        for _ in 0..SAMPLE_HISTORY_SIZE {
+            state.update_metrics(metrics_at(500, 2_000));
+        }
+        assert_eq!(state.tps, 0.0);
+
+        state.update_metrics(metrics_at(600, 60_000));
+        state.update_metrics(metrics_at(1_100, 61_000));
+        assert!((state.tps - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_height_follows_metrics_once_the_websocket_drops() {
+        let mut state = AppState::new();
+        state.update_rpc(RpcData {
+            block_number: 90,
+            ..Default::default()
+        });
+        state.update_metrics(PrometheusMetrics {
+            block_num: 100,
+            ..Default::default()
+        });
+        // While the subscription is up its height leads.
+        assert_eq!(state.block_height(), 90);
+
+        state.set_ws_disconnected("gone".to_string());
+        assert_eq!(state.block_height(), 100);
+
+        state.set_ws_connected();
+        assert_eq!(state.block_height(), 90);
     }
 }
