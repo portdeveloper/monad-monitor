@@ -105,6 +105,10 @@ async fn collect(
         state.update_rpc(r);
         true
     } else {
+        // Mark the source down, as the TUI's event loop would: block_height
+        // then follows the still-answering metrics poll instead of freezing on
+        // the last height this endpoint gave.
+        state.set_ws_disconnected("RPC endpoint did not answer".to_string());
         false
     };
 
