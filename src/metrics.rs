@@ -57,6 +57,10 @@ impl MetricsClient {
             .send()
             .await
             .context("Failed to fetch metrics")?
+            // A non-2xx response carries no metrics, and its body parses to a default
+            // `PrometheusMetrics` — so without this the caller cannot tell a failed
+            // scrape from a node reporting zeroes.
+            .error_for_status()?
             .text()
             .await
             .context("Failed to read metrics body")?;
@@ -142,6 +146,76 @@ fn parse_metric_line(line: &str) -> Option<(&str, f64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve exactly one HTTP response on a loopback port, then return its URL.
+    /// A plain `std::net::TcpListener` on a background thread keeps this test free of
+    /// new dependencies: the crate has no `[dev-dependencies]` and tokio is built
+    /// without the `net` feature, and CONTRIBUTING asks to keep dependencies minimal.
+    fn serve_once(response: String) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("read local addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read the request first: replying before the client has finished
+                // writing can surface as a broken pipe instead of the status we set.
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/metrics")
+    }
+
+    fn http_response(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn http_error_status_is_not_a_successful_scrape() {
+        // Without a status check the error body simply carries no known metrics, so
+        // `parse_metrics` returns a default `PrometheusMetrics` and the caller sees
+        // `Ok(zeroes)` — a failed scrape that is indistinguishable from an idle node.
+        let endpoint = serve_once(http_response(
+            "500 Internal Server Error",
+            "internal server error",
+        ));
+
+        let err = MetricsClient::new(&endpoint)
+            .fetch()
+            .await
+            .expect_err("a 500 must not read as a successful scrape");
+
+        // Assert on the status itself rather than on the message: the URL in the text
+        // carries an ephemeral port, and a port such as 45001 contains "500", so a
+        // substring check could pass without the status ever being looked at.
+        let status = err
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .expect("the failure should carry the HTTP status it saw");
+        assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_successful_response_is_still_parsed() {
+        // The status check must not cost us the happy path.
+        let endpoint = serve_once(http_response(
+            "200 OK",
+            "monad_execution_ledger_block_num{job=\"test\"} 4.1929095e+07 1765694534456\n",
+        ));
+
+        let metrics = MetricsClient::new(&endpoint)
+            .fetch()
+            .await
+            .expect("a 200 with a valid body is a successful scrape");
+
+        assert_eq!(metrics.block_num, 41929095);
+    }
 
     #[test]
     fn test_parse_metric_line() {
