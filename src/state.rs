@@ -251,9 +251,9 @@ impl AppState {
     pub fn alert_sample(&self) -> Sample {
         Sample {
             secs_since_block: self.last_rpc_block_at.map(|t| t.elapsed().as_secs()),
-            finalized_lag: self.system_seen.then(|| self.system.finalized_lag()),
+            finalized_lag: self.system.finalized_lag(),
             peers: self.metrics_seen.then_some(self.metrics.peer_count),
-            disk_pct: self.system_seen.then_some(self.system.disk_used_pct),
+            disk_pct: self.system.disk_used_pct,
         }
     }
 
@@ -478,6 +478,34 @@ mod tests {
         state.update_metrics(metrics_at(600, 60_000));
         state.update_metrics(metrics_at(1_100, 61_000));
         assert!((state.tps - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn an_unread_disk_and_lag_reach_the_thresholds_as_unknown() {
+        // Every source inside SystemClient::fetch failed, so fetch returns a
+        // default SystemData and update_system stores it. The alert engine has
+        // to be told these were never measured, not that they read zero.
+        let mut state = AppState::new();
+        state.update_system(SystemData::default());
+
+        let sample = state.alert_sample();
+        assert_eq!(sample.disk_pct, None);
+        assert_eq!(sample.finalized_lag, None);
+    }
+
+    #[test]
+    fn a_real_reading_still_reaches_the_thresholds() {
+        let mut state = AppState::new();
+        state.update_system(SystemData {
+            disk_used_pct: Some(91.0),
+            history_latest: Some(500),
+            latest_finalized: Some(488),
+            ..Default::default()
+        });
+
+        let sample = state.alert_sample();
+        assert_eq!(sample.disk_pct, Some(91.0));
+        assert_eq!(sample.finalized_lag, Some(12));
     }
 
     #[test]

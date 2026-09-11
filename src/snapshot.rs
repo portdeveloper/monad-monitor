@@ -36,7 +36,9 @@ pub struct Snapshot {
     pub tps: f64,
     pub tps_peak: f64,
     pub peer_health: String,
-    pub finalized_lag: u64,
+    /// `null` when the monad-mpt read did not produce the two heights it is
+    /// derived from, so a script can tell a healthy zero lag from no reading.
+    pub finalized_lag: Option<u64>,
     /// `null` when the public node could not be reached, so a script can tell
     /// "no difference" apart from "no comparison".
     pub block_difference: Option<i64>,
@@ -190,9 +192,9 @@ mod tests {
         };
         state.update_metrics(metrics);
         let system = SystemData {
-            history_latest: 100,
-            latest_finalized: 98,
-            disk_used_pct: 42.5,
+            history_latest: Some(100),
+            latest_finalized: Some(98),
+            disk_used_pct: Some(42.5),
             ..Default::default()
         };
         state.update_system(system);
@@ -205,6 +207,28 @@ mod tests {
         assert_eq!(v["disk_used_pct"], 42.5);
         // derived and lifted to the top level
         assert_eq!(v["finalized_lag"], 2);
+    }
+
+    #[test]
+    fn an_unread_mpt_serializes_as_null_rather_than_zero() {
+        let mut state = AppState::new();
+        state.update_system(SystemData::default());
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+
+        // A script reading these can tell "not measured" from a healthy zero.
+        assert!(v["finalized_lag"].is_null());
+        assert!(v["disk_used_pct"].is_null());
+        assert!(v["latest_finalized"].is_null());
+
+        state.update_system(SystemData {
+            disk_used_pct: Some(79.82),
+            history_latest: Some(102_735_394),
+            latest_finalized: Some(102_735_393),
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(v["finalized_lag"], 1);
+        assert_eq!(v["disk_used_pct"], 79.82);
     }
 
     #[test]

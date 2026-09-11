@@ -16,15 +16,19 @@ const EXTERNAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Data from system commands (monad-mpt, systemctl, external RPC)
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SystemData {
-    // Disk info from monad-mpt
-    pub disk_capacity_gb: f64,
-    pub disk_used_gb: f64,
-    pub disk_used_pct: f64,
-    pub history_count: u64,
-    pub history_earliest: u64,
-    pub history_latest: u64,
-    pub latest_finalized: u64,
-    pub latest_verified: u64,
+    /// Disk and history figures from monad-mpt. `None` when that read did not
+    /// produce them: the binary is missing, the storage device cannot be
+    /// opened, or the output stopped matching. Zero is a reading a full disk
+    /// could never give, so reporting it as one would paint an empty disk and
+    /// a finalized lag of nothing over a node nobody measured.
+    pub disk_capacity_gb: Option<f64>,
+    pub disk_used_gb: Option<f64>,
+    pub disk_used_pct: Option<f64>,
+    pub history_count: Option<u64>,
+    pub history_earliest: Option<u64>,
+    pub history_latest: Option<u64>,
+    pub latest_finalized: Option<u64>,
+    pub latest_verified: Option<u64>,
 
     // Services status
     pub service_bft: bool,
@@ -61,8 +65,11 @@ impl SystemData {
         Some(self.external_block? as i64 - local_block as i64)
     }
 
-    pub fn finalized_lag(&self) -> u64 {
-        self.history_latest.saturating_sub(self.latest_finalized)
+    /// How far the finalized head trails the latest history version. `None`
+    /// while either end of that subtraction is unknown, because a lag of zero
+    /// is what a perfectly healthy node reports.
+    pub fn finalized_lag(&self) -> Option<u64> {
+        Some(self.history_latest?.saturating_sub(self.latest_finalized?))
     }
 
     pub fn all_services_running(&self) -> bool {
@@ -499,13 +506,13 @@ fn parse_mpt_output(output: &str, data: &mut SystemData) {
             && parts[4].ends_with('%')
         {
             if let Ok(cap) = parts[0].parse::<f64>() {
-                data.disk_capacity_gb = size_to_gb(cap, parts[1]);
+                data.disk_capacity_gb = Some(size_to_gb(cap, parts[1]));
             }
             if let Ok(used) = parts[2].parse::<f64>() {
-                data.disk_used_gb = size_to_gb(used, parts[3]);
+                data.disk_used_gb = Some(size_to_gb(used, parts[3]));
             }
             if let Ok(pct) = parts[4].trim_end_matches('%').parse::<f64>() {
-                data.disk_used_pct = pct;
+                data.disk_used_pct = Some(pct);
             }
         }
 
@@ -521,13 +528,13 @@ fn parse_mpt_output(output: &str, data: &mut SystemData) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for (i, part) in parts.iter().enumerate() {
                 if (*part == "has" || *part == "History:") && i + 1 < parts.len() {
-                    data.history_count = trim_num(parts[i + 1]).parse().unwrap_or(0);
+                    data.history_count = trim_num(parts[i + 1]).parse().ok();
                 }
                 if *part == "earliest" && i + 2 < parts.len() {
-                    data.history_earliest = trim_num(parts[i + 2]).parse().unwrap_or(0);
+                    data.history_earliest = trim_num(parts[i + 2]).parse().ok();
                 }
                 if *part == "latest" && i + 2 < parts.len() {
-                    data.history_latest = trim_num(parts[i + 2]).parse().unwrap_or(0);
+                    data.history_latest = trim_num(parts[i + 2]).parse().ok();
                 }
             }
         }
@@ -538,11 +545,11 @@ fn parse_mpt_output(output: &str, data: &mut SystemData) {
             for (i, part) in parts.iter().enumerate() {
                 if *part == "finalized" && i + 2 < parts.len() {
                     let val = parts[i + 2].trim_end_matches(',');
-                    data.latest_finalized = val.parse().unwrap_or(0);
+                    data.latest_finalized = val.parse().ok();
                 }
                 if *part == "verified" && i + 2 < parts.len() {
                     let val = parts[i + 2].trim_end_matches(',');
-                    data.latest_verified = val.parse().unwrap_or(0);
+                    data.latest_verified = val.parse().ok();
                 }
             }
         }
@@ -560,9 +567,9 @@ mod tests {
         let out = "           1.75 Tb        1.31 Tb 75.24%  \"/dev/nvme2n1p1\"";
         let mut data = SystemData::default();
         parse_mpt_output(out, &mut data);
-        assert_eq!(data.disk_used_pct, 75.24);
-        assert!((data.disk_capacity_gb - 1.75 * 1024.0).abs() < 1e-6);
-        assert!((data.disk_used_gb - 1.31 * 1024.0).abs() < 1e-6);
+        assert_eq!(data.disk_used_pct, Some(75.24));
+        assert!((data.disk_capacity_gb.unwrap() - 1.75 * 1024.0).abs() < 1e-6);
+        assert!((data.disk_used_gb.unwrap() - 1.31 * 1024.0).abs() < 1e-6);
     }
 
     #[test]
@@ -570,9 +577,9 @@ mod tests {
         let out = "           1.75 Tb      109.30 Gb  6.11%  \"/dev/nvme2n1p1\"";
         let mut data = SystemData::default();
         parse_mpt_output(out, &mut data);
-        assert_eq!(data.disk_used_pct, 6.11);
-        assert!((data.disk_capacity_gb - 1.75 * 1024.0).abs() < 1e-6);
-        assert!((data.disk_used_gb - 109.30).abs() < 1e-6);
+        assert_eq!(data.disk_used_pct, Some(6.11));
+        assert!((data.disk_capacity_gb.unwrap() - 1.75 * 1024.0).abs() < 1e-6);
+        assert!((data.disk_used_gb.unwrap() - 109.30).abs() < 1e-6);
     }
 
     #[test]
@@ -581,9 +588,9 @@ mod tests {
         let out = "        History: 7973666 versions, earliest is 41193452, latest is 49167117";
         let mut data = SystemData::default();
         parse_mpt_output(out, &mut data);
-        assert_eq!(data.history_count, 7973666);
-        assert_eq!(data.history_earliest, 41193452);
-        assert_eq!(data.history_latest, 49167117);
+        assert_eq!(data.history_count, Some(7973666));
+        assert_eq!(data.history_earliest, Some(41193452));
+        assert_eq!(data.history_latest, Some(49167117));
     }
 
     #[test]
@@ -591,9 +598,9 @@ mod tests {
         let out = "MPT database has 637751 history, earliest is 41295350 latest is 41933100.";
         let mut data = SystemData::default();
         parse_mpt_output(out, &mut data);
-        assert_eq!(data.history_count, 637751);
-        assert_eq!(data.history_earliest, 41295350);
-        assert_eq!(data.history_latest, 41933100);
+        assert_eq!(data.history_count, Some(637751));
+        assert_eq!(data.history_earliest, Some(41295350));
+        assert_eq!(data.history_latest, Some(41933100));
     }
 
     #[test]
@@ -603,9 +610,36 @@ mod tests {
                    Latest finalized is 498, latest verified is 495";
         let mut data = SystemData::default();
         parse_mpt_output(out, &mut data);
-        assert_eq!(data.history_latest, 500);
-        assert_eq!(data.latest_finalized, 498);
-        assert_eq!(data.finalized_lag(), 2);
+        assert_eq!(data.history_latest, Some(500));
+        assert_eq!(data.latest_finalized, Some(498));
+        assert_eq!(data.finalized_lag(), Some(2));
+    }
+
+    #[test]
+    fn a_failed_mpt_read_leaves_every_figure_unknown() {
+        // What fetch() is left holding when monad-mpt is missing, cannot open
+        // the storage device, or prints something this parser does not match.
+        let mut data = SystemData::default();
+        parse_mpt_output("monad-mpt: cannot open /dev/triedb", &mut data);
+
+        assert_eq!(data.disk_used_pct, None);
+        assert_eq!(data.disk_capacity_gb, None);
+        assert_eq!(data.history_latest, None);
+        assert_eq!(data.latest_finalized, None);
+        assert_eq!(data.finalized_lag(), None);
+    }
+
+    #[test]
+    fn a_half_parsed_read_keeps_the_half_it_got() {
+        // The disk line matched but the history lines did not: the figures that
+        // were read stay, the ones that were not stay unknown rather than zero.
+        let out = "           1.75 Tb        1.31 Tb 75.24%  \"/dev/nvme2n1p1\"";
+        let mut data = SystemData::default();
+        parse_mpt_output(out, &mut data);
+
+        assert_eq!(data.disk_used_pct, Some(75.24));
+        assert_eq!(data.history_latest, None);
+        assert_eq!(data.finalized_lag(), None);
     }
 
     #[test]

@@ -372,13 +372,13 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
         Color::Red
     };
 
-    // Disk usage
-    let disk_color = if sys.disk_used_pct < 50.0 {
-        Color::Green
-    } else if sys.disk_used_pct < 80.0 {
-        Color::Yellow
-    } else {
-        Color::Red
+    // Disk usage. Unknown when the monad-mpt read did not produce it, the same
+    // way CPU is unknown before its second sample.
+    let (disk_text, disk_color) = match sys.disk_used_pct {
+        Some(pct) if pct < 50.0 => (format!("{:.0}%", pct), Color::Green),
+        Some(pct) if pct < 80.0 => (format!("{:.0}%", pct), Color::Yellow),
+        Some(pct) => (format!("{:.0}%", pct), Color::Red),
+        None => ("...".to_string(), label_color),
     };
     let disk_color = alert_or(state, AlertKind::DiskFull, disk_color);
 
@@ -392,8 +392,12 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
     let net_tx = AppState::format_bandwidth(state.net_tx_rate);
 
     // Finalized lag
-    let fin_lag = sys.finalized_lag();
-    let lag_color = if fin_lag <= 3 { Color::Green } else if fin_lag <= 10 { Color::Yellow } else { Color::Red };
+    let (lag_text, lag_color) = match sys.finalized_lag() {
+        Some(lag) if lag <= 3 => (format!("-{}", lag), Color::Green),
+        Some(lag) if lag <= 10 => (format!("-{}", lag), Color::Yellow),
+        Some(lag) => (format!("-{}", lag), Color::Red),
+        None => ("...".to_string(), label_color),
+    };
     let lag_color = alert_or(state, AlertKind::FinalizedLag, lag_color);
 
     let stats = Line::from(vec![
@@ -405,7 +409,7 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
         Span::styled(format!(" ({:.0}G)", sys.memory_used_gb), Style::default().fg(label_color)),
         Span::raw("  |  "),
         Span::styled("DISK: ", Style::default().fg(label_color)),
-        Span::styled(format!("{:.0}%", sys.disk_used_pct), Style::default().fg(disk_color)),
+        Span::styled(disk_text, Style::default().fg(disk_color)),
         Span::raw("  |  "),
         Span::styled("NET: ", Style::default().fg(label_color)),
         Span::styled(format!("↓{} ↑{}", net_rx, net_tx), Style::default().fg(value_color)),
@@ -414,7 +418,7 @@ fn draw_secondary_stats(frame: &mut Frame, area: Rect, state: &AppState, label_c
         Span::styled(services_str, Style::default().fg(services_color)),
         Span::raw("  |  "),
         Span::styled("FIN: ", Style::default().fg(label_color)),
-        Span::styled(format!("-{}", fin_lag), Style::default().fg(lag_color)),
+        Span::styled(lag_text, Style::default().fg(lag_color)),
     ]);
 
     frame.render_widget(Paragraph::new(stats), inner);
