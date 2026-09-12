@@ -436,6 +436,9 @@ mod tests {
         assert!(parse_args(&args(&["--alert-noblock", "30"])).is_err());
         assert!(parse_args(&args(&["--alert-min-peers"])).is_err());
         assert!(parse_args(&args(&["--alert-min-peers", "lots"])).is_err());
+        assert!(parse_args(&args(&["--alert-disk", "nan"])).is_err());
+        assert!(parse_args(&args(&["--alert-disk", "101"])).is_err());
+        assert!(parse_args(&args(&["--alert-disk", "-1"])).is_err());
     }
 
     #[test]

@@ -128,7 +128,7 @@ impl AlertConfig {
             "--alert-no-block" => self.no_block_secs = Some(parse_num(flag, value)?),
             "--alert-finalized-lag" => self.finalized_lag = Some(parse_num(flag, value)?),
             "--alert-min-peers" => self.min_peers = Some(parse_num(flag, value)?),
-            "--alert-disk" => self.disk_pct = Some(parse_num(flag, value)?),
+            "--alert-disk" => self.disk_pct = Some(parse_pct(flag, value)?),
             "--alert-confirm" => {
                 let samples: u32 = parse_num(flag, value)?;
                 if samples == 0 {
@@ -165,6 +165,19 @@ where
     value
         .parse::<T>()
         .map_err(|_| format!("{} expects a number, got {:?}", flag, value))
+}
+
+/// A percentage threshold. `parse_num` alone accepts `NaN`, the infinities and
+/// any value off the scale, each of which arms an alert that can never fire.
+fn parse_pct(flag: &str, value: &str) -> Result<f64, String> {
+    let pct: f64 = parse_num(flag, value)?;
+    if !(0.0..=100.0).contains(&pct) {
+        return Err(format!(
+            "{} expects a percentage from 0 to 100, got {:?}",
+            flag, value
+        ));
+    }
+    Ok(pct)
 }
 
 /// One evaluation's worth of readings. A field is `None` while its source has
@@ -706,6 +719,23 @@ mod tests {
 
         config.apply("--alert-cooldown", "60").unwrap();
         assert_eq!(config.cooldown_secs, 60);
+
+        // Both ends of the scale are usable thresholds, and a fraction of a
+        // percent survives the round trip.
+        for (value, expected) in [
+            ("0", 0.0),
+            ("100", 100.0),
+            ("85.5", 85.5),
+            // Anything f64 accepts on the scale: exponents and a sign are not
+            // a reason to refuse a threshold that is in range.
+            ("1e2", 100.0),
+            ("+50", 50.0),
+            ("-0", 0.0),
+        ] {
+            let mut config = AlertConfig::default();
+            config.apply("--alert-disk", value).unwrap();
+            assert_eq!(config.disk_pct, Some(expected));
+        }
     }
 
     #[test]
@@ -731,6 +761,26 @@ mod tests {
         assert!(config
             .apply("--webhook-url", "DISCORD_WEBHOOK_URL")
             .is_err());
+
+        // Every one of these parses as an f64 and arms a threshold that can
+        // never fire. 1e400 is the quiet one: not a parse failure, it
+        // overflows to an infinity. "lots" still has to fail as a number.
+        for value in ["nan", "inf", "-inf", "1e400", "-1", "101", "lots"] {
+            let message = match config.apply("--alert-disk", value) {
+                Err(message) => message,
+                Ok(()) => panic!("{:?} should be rejected", value),
+            };
+
+            // Echo what was typed, not the parsed float: "1e400" is the one
+            // the operator would never recognise as the infinity it became.
+            assert!(
+                message.contains("--alert-disk") && message.contains(value),
+                "{:?} gave {:?}",
+                value,
+                message
+            );
+            assert_eq!(config.disk_pct, None, "{:?} armed the alert", value);
+        }
     }
 
     #[test]
