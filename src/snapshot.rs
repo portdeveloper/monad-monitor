@@ -187,7 +187,7 @@ mod tests {
     fn flattened_metrics_and_system_fields_are_present() {
         let mut state = AppState::new();
         let metrics = PrometheusMetrics {
-            peer_count: 7,
+            peer_count: Some(7),
             ..Default::default()
         };
         state.update_metrics(metrics);
@@ -229,6 +229,27 @@ mod tests {
         let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
         assert_eq!(v["finalized_lag"], 1);
         assert_eq!(v["disk_used_pct"], 79.82);
+    }
+
+    #[test]
+    fn an_unknown_peer_count_serializes_as_null_rather_than_zero() {
+        // A scrape that omitted the metric must not reach a JSON consumer as a
+        // node with no peers. A real zero still has to survive as zero.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: 100,
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert!(v["peer_count"].is_null());
+        assert_eq!(v["block_num"], 100, "the rest of the scrape survives");
+
+        state.update_metrics(PrometheusMetrics {
+            peer_count: Some(0),
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(v["peer_count"], 0);
     }
 
     #[test]

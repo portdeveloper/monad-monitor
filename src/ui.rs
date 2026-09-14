@@ -266,6 +266,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
     let peer_color = match peer_health {
         "healthy" => Color::Green,
         "ok" => Color::Yellow,
+        "..." => label_color,
         _ => Color::Red,
     };
 
@@ -279,7 +280,10 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
         Line::from(Span::styled("PEERS", Style::default().fg(label_color))),
         Line::from(vec![
             Span::styled(
-                format!("{}", peer_count),
+                match peer_count {
+                    Some(n) => n.to_string(),
+                    None => "...".to_string(),
+                },
                 Style::default()
                     .fg(alert_or(state, AlertKind::LowPeers, value_color))
                     .bold(),

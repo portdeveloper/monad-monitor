@@ -8,7 +8,11 @@ pub struct PrometheusMetrics {
     pub block_num: u64,
     pub tx_commits: u64,
     pub tx_commits_timestamp_ms: u64,
-    pub peer_count: u64,
+    /// `None` when the scrape did not carry `monad_peer_disc_num_peers`, or
+    /// carried a value that would not parse. Zero is a reading a connected node
+    /// can genuinely give, so reporting an unread field as one would raise a
+    /// low-peer alert against a count nobody took.
+    pub peer_count: Option<u64>,
     pub statesync_progress: u64,
     pub statesync_target: u64,
     // New metrics
@@ -90,7 +94,7 @@ fn parse_metrics(body: &str) -> Result<PrometheusMetrics> {
                     metrics.tx_commits_timestamp_ms = timestamp;
                 }
                 "monad_peer_disc_num_peers" => {
-                    metrics.peer_count = value as u64;
+                    metrics.peer_count = Some(value as u64);
                 }
                 "monad_statesync_progress_estimate" => {
                     metrics.statesync_progress = value as u64;
@@ -224,5 +228,40 @@ mod tests {
         assert_eq!(name, "monad_execution_ledger_block_num");
         assert_eq!(value as u64, 41929095);
         assert_eq!(ts, 1765694534456);
+    }
+
+    #[test]
+    fn a_missing_peer_metric_is_unknown_not_zero() {
+        // The scrape succeeded, it simply did not carry this field. Everything
+        // else in the body has to survive that.
+        let m = parse_metrics("monad_execution_ledger_block_num 100\n").expect("parse");
+
+        assert_eq!(m.peer_count, None);
+        assert_eq!(m.block_num, 100);
+    }
+
+    #[test]
+    fn a_malformed_peer_value_is_unknown_not_zero() {
+        // parse_metric_line rejects the whole line, which used to leave the
+        // field at its struct default and read as a measured zero.
+        let m = parse_metrics(
+            "monad_execution_ledger_block_num 100\nmonad_peer_disc_num_peers not_a_number\n",
+        )
+        .expect("parse");
+
+        assert_eq!(m.peer_count, None);
+        assert_eq!(m.block_num, 100);
+    }
+
+    #[test]
+    fn a_real_zero_peer_count_is_still_a_reading() {
+        let m = parse_metrics("monad_peer_disc_num_peers 0\n").expect("parse");
+        assert_eq!(m.peer_count, Some(0));
+    }
+
+    #[test]
+    fn a_positive_peer_count_is_read() {
+        let m = parse_metrics("monad_peer_disc_num_peers 12\n").expect("parse");
+        assert_eq!(m.peer_count, Some(12));
     }
 }

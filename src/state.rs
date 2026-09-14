@@ -75,7 +75,7 @@ pub struct AppState {
 
     // Latency tracking
     latency_prev: u64,
-    peers_prev: u64,
+    peers_prev: Option<u64>,
 
     // Network rate tracking
     net_rx_prev: u64,
@@ -119,7 +119,7 @@ impl AppState {
             system_seen: false,
             alerts: AlertState::default(),
             latency_prev: 0,
-            peers_prev: 0,
+            peers_prev: None,
             net_rx_prev: 0,
             net_tx_prev: 0,
             net_rx_rate: 0.0,
@@ -252,7 +252,7 @@ impl AppState {
         Sample {
             secs_since_block: self.last_rpc_block_at.map(|t| t.elapsed().as_secs()),
             finalized_lag: self.system.finalized_lag(),
-            peers: self.metrics_seen.then_some(self.metrics.peer_count),
+            peers: self.metrics.peer_count,
             disk_pct: self.system.disk_used_pct,
         }
     }
@@ -351,10 +351,13 @@ impl AppState {
 
     pub fn peer_health(&self) -> &'static str {
         match self.metrics.peer_count {
-            0 => "no peers",
-            1..=10 => "low",
-            11..=50 => "ok",
-            _ => "healthy",
+            // A scrape that never carried the metric is not a node with no
+            // peers. Say so, rather than colouring an unmeasured field red.
+            None => "...",
+            Some(0) => "no peers",
+            Some(1..=10) => "low",
+            Some(11..=50) => "ok",
+            Some(_) => "healthy",
         }
     }
 
@@ -398,14 +401,21 @@ impl AppState {
 
     /// Returns peer count trend: 1 = up, -1 = down, 0 = stable
     pub fn peers_trend(&self) -> i8 {
-        let current = self.metrics.peer_count;
-        let threshold = 5; // Need 5 peer difference to show trend
-        if current > self.peers_prev + threshold {
-            1
-        } else if current + threshold < self.peers_prev {
-            -1
-        } else {
-            0
+        // A trend needs two readings. Treating an unknown as zero drew a
+        // rising arrow on the first reading, and a falling one the moment the
+        // metric dropped out -- neither of which was a move.
+        match (self.metrics.peer_count, self.peers_prev) {
+            (Some(current), Some(prev)) => {
+                let threshold = 5; // Need 5 peer difference to show trend
+                if current > prev + threshold {
+                    1
+                } else if current + threshold < prev {
+                    -1
+                } else {
+                    0
+                }
+            }
+            _ => 0,
         }
     }
 
@@ -506,6 +516,78 @@ mod tests {
         let sample = state.alert_sample();
         assert_eq!(sample.disk_pct, Some(91.0));
         assert_eq!(sample.finalized_lag, Some(12));
+    }
+
+    #[test]
+    fn an_unread_peer_count_reaches_the_threshold_as_unknown() {
+        // The scrape succeeded and carried a block height, but no peer metric.
+        // The alert engine has to be told it was never measured, otherwise the
+        // low-peer threshold trips on a reading nobody took.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: 100,
+            ..Default::default()
+        });
+
+        assert_eq!(state.alert_sample().peers, None);
+        assert_eq!(state.peer_health(), "...");
+    }
+
+    #[test]
+    fn a_real_zero_peer_count_still_reaches_the_threshold() {
+        // Zero peers is a measurement, and it is the one the alert exists for.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            peer_count: Some(0),
+            ..Default::default()
+        });
+
+        assert_eq!(state.alert_sample().peers, Some(0));
+        assert_eq!(state.peer_health(), "no peers");
+    }
+
+    #[test]
+    fn a_real_move_between_two_readings_sets_the_trend() {
+        // The unknown cases above say nothing about the comparison itself, so
+        // this binds it: a rise, a fall, a move inside the threshold, and the
+        // boundary that separates the first two from the third.
+        let mut state = AppState::new();
+        let reading = |n| PrometheusMetrics {
+            peer_count: Some(n),
+            ..Default::default()
+        };
+
+        state.update_metrics(reading(10));
+        state.update_metrics(reading(20));
+        assert_eq!(state.peers_trend(), 1, "10 -> 20 is a rise");
+
+        state.update_metrics(reading(5));
+        assert_eq!(state.peers_trend(), -1, "20 -> 5 is a fall");
+
+        state.update_metrics(reading(7));
+        assert_eq!(state.peers_trend(), 0, "5 -> 7 is inside the threshold");
+
+        state.update_metrics(reading(12));
+        assert_eq!(state.peers_trend(), 0, "a gain of exactly 5 is not a move");
+    }
+
+    #[test]
+    fn an_unknown_peer_count_draws_no_trend() {
+        // peers_prev starts unknown, so the first real reading has nothing to
+        // compare against; treating unknown as 0 would draw a rising arrow on
+        // the first scrape and a falling one when the metric dropped out.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            peer_count: Some(40),
+            ..Default::default()
+        });
+        assert_eq!(state.peers_trend(), 0, "no previous reading to compare");
+
+        state.update_metrics(PrometheusMetrics {
+            block_num: 100,
+            ..Default::default()
+        });
+        assert_eq!(state.peers_trend(), 0, "current reading is unknown");
     }
 
     #[test]
