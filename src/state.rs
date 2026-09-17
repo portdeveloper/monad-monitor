@@ -591,6 +591,29 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_countable_peer_reading_does_not_overflow_the_trend() {
+        // peers_trend adds 5 to the previous reading. A `+Inf` on the metric line
+        // used to saturate the cast to u64::MAX, and `prev + 5` then overflowed:
+        // a panic in debug, a wrap in release. The parser now refuses anything
+        // from 2^64 up, so the largest value that can reach here is the biggest
+        // integer an f64 holds below that -- and it has to stay inside u64.
+        const LARGEST: u64 = 18_446_744_073_709_549_568; // 2^64 - 2048
+
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            peer_count: Some(LARGEST),
+            ..Default::default()
+        });
+        state.update_metrics(PrometheusMetrics {
+            peer_count: Some(LARGEST),
+            ..Default::default()
+        });
+
+        assert_eq!(state.peers_trend(), 0);
+        assert_eq!(LARGEST.checked_add(5), Some(18_446_744_073_709_549_573));
+    }
+
+    #[test]
     fn the_height_follows_metrics_once_the_websocket_drops() {
         let mut state = AppState::new();
         state.update_rpc(RpcData {

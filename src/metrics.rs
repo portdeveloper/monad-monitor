@@ -94,7 +94,7 @@ fn parse_metrics(body: &str) -> Result<PrometheusMetrics> {
                     metrics.tx_commits_timestamp_ms = timestamp;
                 }
                 "monad_peer_disc_num_peers" => {
-                    metrics.peer_count = Some(value as u64);
+                    metrics.peer_count = peer_count(value);
                 }
                 "monad_statesync_progress_estimate" => {
                     metrics.statesync_progress = value as u64;
@@ -120,6 +120,34 @@ fn parse_metrics(body: &str) -> Result<PrometheusMetrics> {
     }
 
     Ok(metrics)
+}
+
+/// A peer count read off the wire, or `None` when the number was not one.
+///
+/// Prometheus carries every value as a float, so a line can parse cleanly and
+/// still not be a count. `as u64` would turn `NaN` and any negative into 0 --
+/// the reading a node with no peers gives, which is exactly the confusion this
+/// field was made optional to end -- saturate an infinity to `u64::MAX`, and
+/// truncate `1.5` to 1. A count that is not whole, not finite, negative or past
+/// the end of the type was never a measurement, so it stays unknown.
+fn peer_count(value: f64) -> Option<u64> {
+    // `is_finite` is deliberately explicit rather than load-bearing: no input can
+    // reach the arms behind it, since `-Inf` is already negative and both `NaN`
+    // and `+Inf` have a `fract()` of `NaN`, which is not equal to 0.0. Rejecting
+    // them only as a side effect of a float comparison would be a trap for the
+    // next reader. `-0.0` is a zero reading rather than a negative one, so the
+    // sign test is a comparison, not `is_sign_negative`.
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        return None;
+    }
+    // 2^64, the first f64 past `u64::MAX`. Without this the cast saturates and
+    // hands back `u64::MAX` as though it had been measured; that value also
+    // overflows the peer-trend arithmetic in `state.rs`.
+    const ABOVE_U64_MAX: f64 = 18_446_744_073_709_551_616.0;
+    if value >= ABOVE_U64_MAX {
+        return None;
+    }
+    Some(value as u64)
 }
 
 fn parse_metric_line(line: &str) -> Option<(&str, f64, u64)> {
@@ -251,6 +279,66 @@ mod tests {
 
         assert_eq!(m.peer_count, None);
         assert_eq!(m.block_num, 100);
+    }
+
+    #[test]
+    fn a_peer_value_that_is_not_a_count_is_unknown_not_a_reading() {
+        // parse_metric_line only asks that the text parse as f64, and Prometheus
+        // carries every value as a float. These all parse, and `as u64` gave each
+        // of them a plausible-looking count: NaN and the negatives became 0, the
+        // same reading a node with no peers gives; +Inf saturated to u64::MAX,
+        // which reads as healthy and overflows the peer-trend arithmetic; 1.5
+        // truncated to 1, which reads as a low-peer node.
+        for value in [
+            "NaN",
+            "nan",
+            "inf",
+            "+Inf",
+            "-Inf",
+            "-1",
+            "-0.5",
+            "1.5",
+            "0.1",
+            // 2^64 and past it: the cast saturates rather than refusing.
+            "18446744073709551616",
+            "1e20",
+            // u64::MAX itself, which no f64 can hold: the text rounds to 2^64 on
+            // the way in, so it arrives indistinguishable from the row above.
+            "18446744073709551615",
+        ] {
+            let body = format!(
+                "monad_execution_ledger_block_num 100\nmonad_peer_disc_num_peers {}\n",
+                value
+            );
+            let m = parse_metrics(&body).expect("parse");
+
+            assert_eq!(m.peer_count, None, "{:?} was stored as a count", value);
+            // The rest of the scrape is still good; one bad line is not a failed
+            // scrape.
+            assert_eq!(m.block_num, 100, "{:?} lost the block height", value);
+        }
+    }
+
+    #[test]
+    fn a_whole_nonnegative_peer_count_is_still_a_reading() {
+        // The other side of the check: the values that ARE counts must survive
+        // it, including a zero, a signed zero and one written as a float.
+        for (value, expected) in [
+            ("0", 0u64),
+            ("-0", 0),
+            ("0.0", 0),
+            ("1", 1),
+            ("12", 12),
+            ("12.0", 12),
+            ("1e2", 100),
+            // Large but exactly representable, so it survives the f64 the metric
+            // line is carried in. 2^53 is where that stops being true in general.
+            ("9007199254740992", 9_007_199_254_740_992),
+        ] {
+            let body = format!("monad_peer_disc_num_peers {}\n", value);
+            let m = parse_metrics(&body).expect("parse");
+            assert_eq!(m.peer_count, Some(expected), "{:?} was refused", value);
+        }
     }
 
     #[test]
