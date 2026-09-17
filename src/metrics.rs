@@ -1,6 +1,14 @@
-use anyhow::{Context, Result};
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Serialize;
+use tokio::time::timeout;
+
+/// How long a single scrape may take, headers and body together. The TUI awaits
+/// each scrape before the next tick, so an endpoint that accepts a connection and
+/// then goes quiet used to park the polling task for good.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Metrics fetched from Prometheus endpoint
 #[derive(Debug, Clone, Default, Serialize)]
@@ -35,13 +43,21 @@ impl PrometheusMetrics {
 pub struct MetricsClient {
     client: Client,
     endpoint: String,
+    fetch_timeout: Duration,
 }
 
 impl MetricsClient {
     pub fn new(endpoint: &str) -> Self {
+        Self::with_timeout(endpoint, FETCH_TIMEOUT)
+    }
+
+    /// Same client with an explicit deadline, so tests do not have to wait out
+    /// `FETCH_TIMEOUT` to observe a stalled endpoint.
+    fn with_timeout(endpoint: &str, fetch_timeout: Duration) -> Self {
         Self {
             client: Client::new(),
             endpoint: endpoint.to_string(),
+            fetch_timeout,
         }
     }
 
@@ -51,6 +67,19 @@ impl MetricsClient {
     }
 
     pub async fn fetch(&self) -> Result<PrometheusMetrics> {
+        // Dropping the request future on expiry closes the connection, so the next
+        // tick scrapes instead of queueing behind a request that will never answer.
+        timeout(self.fetch_timeout, self.scrape())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "Metrics scrape timed out after {}s",
+                    self.fetch_timeout.as_secs_f32()
+                )
+            })?
+    }
+
+    async fn scrape(&self) -> Result<PrometheusMetrics> {
         let body = self
             .client
             .get(&self.endpoint)
@@ -147,6 +176,10 @@ fn parse_metric_line(line: &str) -> Option<(&str, f64, u64)> {
 mod tests {
     use super::*;
 
+    /// Short enough to keep the stalled-endpoint tests fast, long enough that a
+    /// loopback response is never mistaken for a hang.
+    const TEST_TIMEOUT: Duration = Duration::from_millis(250);
+
     /// Serve exactly one HTTP response on a loopback port, then return its URL.
     /// A plain `std::net::TcpListener` on a background thread keeps this test free of
     /// new dependencies: the crate has no `[dev-dependencies]` and tokio is built
@@ -162,6 +195,43 @@ mod tests {
                 // writing can surface as a broken pipe instead of the status we set.
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/metrics")
+    }
+
+    /// Serve connections that never finish a response: each one is accepted, its
+    /// request is read, then the stream is parked in `held` so the socket stays
+    /// open. `partial` is what the endpoint manages to write before going quiet —
+    /// `None` stalls on the headers, a header block with an unfilled
+    /// `Content-Length` stalls on the body. Once `stalls` connections have been
+    /// parked, the next one is answered with `response`.
+    fn serve_stalling(stalls: usize, partial: Option<String>, response: String) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("read local addr");
+        std::thread::spawn(move || {
+            let mut stalled = 0usize;
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                if stalled < stalls {
+                    stalled += 1;
+                    if let Some(partial) = &partial {
+                        let _ = stream.write_all(partial.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    // Parking the stream rather than dropping it is the point: a
+                    // closed socket would fail the scrape at once, which is not
+                    // the hang this guards against.
+                    held.push(stream);
+                    continue;
+                }
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
             }
@@ -213,6 +283,70 @@ mod tests {
             .fetch()
             .await
             .expect("a 200 with a valid body is a successful scrape");
+
+        assert_eq!(metrics.block_num, 41929095);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_response_header_ends_the_scrape() {
+        // The polling task awaits each scrape, so an endpoint that accepts the
+        // connection and then says nothing used to stop metrics for the session.
+        let endpoint = serve_stalling(1, None, http_response("200 OK", ""));
+
+        let err = MetricsClient::with_timeout(&endpoint, TEST_TIMEOUT)
+            .fetch()
+            .await
+            .expect_err("an endpoint that never answers is not a successful scrape");
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "the failure should read as a timeout, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_response_body_ends_the_scrape() {
+        // Headers alone are not the finish line: the body is read separately, and a
+        // `Content-Length` the endpoint never fills hangs just as the headers do.
+        let endpoint = serve_stalling(
+            1,
+            Some(
+                "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\nmonad_peer_disc_num_peers 7"
+                    .to_string(),
+            ),
+            http_response("200 OK", ""),
+        );
+
+        let err = MetricsClient::with_timeout(&endpoint, TEST_TIMEOUT)
+            .fetch()
+            .await
+            .expect_err("a body that never arrives is not a successful scrape");
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "the failure should read as a timeout, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_recovers_once_the_endpoint_answers_again() {
+        // A timeout has to leave the client usable, otherwise the panel stays on the
+        // error for as long as the process runs.
+        let endpoint = serve_stalling(
+            1,
+            None,
+            http_response(
+                "200 OK",
+                "monad_execution_ledger_block_num{job=\"test\"} 4.1929095e+07 1765694534456\n",
+            ),
+        );
+        let client = MetricsClient::with_timeout(&endpoint, TEST_TIMEOUT);
+
+        client.fetch().await.expect_err("the first scrape stalls");
+        let metrics = client
+            .fetch()
+            .await
+            .expect("the next scrape should reach a healthy endpoint");
 
         assert_eq!(metrics.block_num, 41929095);
     }

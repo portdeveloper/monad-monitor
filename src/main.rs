@@ -19,7 +19,7 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::prelude::*;
 use tokio::sync::mpsc;
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 
 use crate::alerts::AlertConfig;
 use crate::config::Config;
@@ -275,6 +275,11 @@ async fn run_app<B: Backend>(
     tokio::spawn(async move {
         let metrics_client = MetricsClient::new(&metrics_url);
         let mut refresh_interval = interval(metrics_period);
+        // A scrape that runs to its deadline leaves every tick it covered due at
+        // once; with the default behaviour the task would drain that backlog in a
+        // burst the moment the endpoint answers again. Delay keeps one scrape per
+        // period no matter how long the last one took.
+        refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             refresh_interval.tick().await;
