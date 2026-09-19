@@ -61,8 +61,8 @@ pub struct SystemData {
 }
 
 impl SystemData {
-    pub fn block_difference(&self, local_block: u64) -> Option<i64> {
-        Some(self.external_block? as i64 - local_block as i64)
+    pub fn block_difference(&self, local_block: Option<u64>) -> Option<i64> {
+        Some(self.external_block? as i64 - local_block? as i64)
     }
 
     /// How far the finalized head trails the latest history version. `None`
@@ -765,16 +765,16 @@ mod tests {
             external_block: Some(1000),
             ..Default::default()
         };
-        assert_eq!(data.block_difference(1000), Some(0));
-        assert_eq!(data.block_difference(994), Some(6));
-        assert_eq!(data.block_difference(1003), Some(-3));
+        assert_eq!(data.block_difference(Some(1000)), Some(0));
+        assert_eq!(data.block_difference(Some(994)), Some(6));
+        assert_eq!(data.block_difference(Some(1003)), Some(-3));
     }
 
     #[test]
     fn without_an_external_height_there_is_no_difference_to_report() {
         let data = SystemData::default();
         assert_eq!(data.external_block, None);
-        assert_eq!(data.block_difference(1000), None);
+        assert_eq!(data.block_difference(Some(1000)), None);
     }
 
     #[test]

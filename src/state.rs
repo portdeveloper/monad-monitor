@@ -74,7 +74,7 @@ pub struct AppState {
     pub alerts: AlertState,
 
     // Latency tracking
-    latency_prev: u64,
+    latency_prev: Option<u64>,
     peers_prev: Option<u64>,
 
     // Network rate tracking
@@ -118,7 +118,7 @@ impl AppState {
             metrics_seen: false,
             system_seen: false,
             alerts: AlertState::default(),
-            latency_prev: 0,
+            latency_prev: None,
             peers_prev: None,
             net_rx_prev: 0,
             net_tx_prev: 0,
@@ -152,18 +152,24 @@ impl AppState {
     }
 
     pub fn update_metrics(&mut self, metrics: PrometheusMetrics) {
-        // Track new block
-        if metrics.block_num > self.last_block_number {
-            self.last_block_time = Some(Instant::now());
-            self.last_block_number = metrics.block_num;
+        // Track new block. An unread height is not a height that moved, so it
+        // must not refresh the "last block seen" clock the staleness display
+        // hangs off.
+        if let Some(block_num) = metrics.block_num {
+            if block_num > self.last_block_number {
+                self.last_block_time = Some(Instant::now());
+                self.last_block_number = block_num;
+            }
         }
 
         // Add TX sample for TPS calculation
         let mut sampled = false;
-        if metrics.tx_commits_timestamp_ms > 0 {
+        if let (Some(tx_commits), ts_ms @ 1..) =
+            (metrics.tx_commits, metrics.tx_commits_timestamp_ms)
+        {
             let sample = TxSample {
-                tx_commits: metrics.tx_commits,
-                timestamp_ms: metrics.tx_commits_timestamp_ms,
+                tx_commits,
+                timestamp_ms: ts_ms,
             };
 
             // Only add if timestamp is newer
@@ -317,20 +323,27 @@ impl AppState {
         self.last_block_time.map(|t| t.elapsed())
     }
 
-    pub fn block_height(&self) -> u64 {
+    /// The height to show, or `None` when neither source has reported one.
+    ///
+    /// Inventing a zero here would undo the point of the metric being optional:
+    /// zero is a real height a node at genesis reports, and the snapshot would
+    /// say `block_num: null` next to `block_height: 0`.
+    pub fn block_height(&self) -> Option<u64> {
+        // 0 is this field's own "not reported" marker on the RPC side.
+        let rpc = (self.rpc_data.block_number > 0).then_some(self.rpc_data.block_number);
+
         // The WebSocket's height leads while the subscription is up. Once it
         // drops, that number only ages, and the metrics poll is still
         // reporting; taking the higher of the two keeps the header moving
         // instead of frozen at the moment the stream died.
         if !self.ws_connected {
-            return self.rpc_data.block_number.max(self.metrics.block_num);
+            return match (rpc, self.metrics.block_num) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (found, None) | (None, found) => found,
+            };
         }
         // Prefer RPC block number as it's more accurate
-        if self.rpc_data.block_number > 0 {
-            self.rpc_data.block_number
-        } else {
-            self.metrics.block_num
-        }
+        rpc.or(self.metrics.block_num)
     }
 
     pub fn recent_blocks(&self) -> &[Block] {
@@ -388,14 +401,21 @@ impl AppState {
 
     /// Returns latency trend: 1 = worsening, -1 = improving, 0 = stable
     pub fn latency_trend(&self) -> i8 {
-        let current = self.metrics.latency_p99_ms;
-        let threshold = 20; // Need 20ms difference to show trend
-        if current > self.latency_prev + threshold {
-            1 // Getting worse
-        } else if current + threshold < self.latency_prev {
-            -1 // Improving
-        } else {
-            0
+        // Two real readings or no arrow, the same rule peers_trend follows: an
+        // unknown treated as zero draws an improvement on the first reading and
+        // a worsening the moment the metric comes back.
+        match (self.metrics.latency_p99_ms, self.latency_prev) {
+            (Some(current), Some(prev)) => {
+                let threshold = 20; // Need 20ms difference to show trend
+                if current > prev + threshold {
+                    1 // Getting worse
+                } else if current + threshold < prev {
+                    -1 // Improving
+                } else {
+                    0
+                }
+            }
+            _ => 0,
         }
     }
 
@@ -441,7 +461,7 @@ mod tests {
 
     fn metrics_at(commits: u64, ts_ms: u64) -> PrometheusMetrics {
         PrometheusMetrics {
-            tx_commits: commits,
+            tx_commits: Some(commits),
             tx_commits_timestamp_ms: ts_ms,
             ..Default::default()
         }
@@ -525,7 +545,7 @@ mod tests {
         // low-peer threshold trips on a reading nobody took.
         let mut state = AppState::new();
         state.update_metrics(PrometheusMetrics {
-            block_num: 100,
+            block_num: Some(100),
             ..Default::default()
         });
 
@@ -572,6 +592,180 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_height_is_unknown_rather_than_genesis() {
+        // The snapshot must not say block_num: null next to block_height: 0.
+        // Zero is a height a node at genesis genuinely reports, so inventing it
+        // here would undo exactly what making the field optional bought.
+        // Both branches: the websocket leads while it is up, and the metrics
+        // poll takes over once it drops. Neither may invent a height.
+        let mut state = AppState::new();
+        assert_eq!(state.metrics.block_num, None);
+        assert_eq!(
+            state.block_height(),
+            None,
+            "an unread height read as genesis while disconnected"
+        );
+
+        state.set_ws_connected();
+        assert_eq!(
+            state.block_height(),
+            None,
+            "an unread height read as genesis while connected"
+        );
+        state.set_ws_disconnected("gone".to_string());
+
+        // And with no local height there is nothing to compare against.
+        assert_eq!(
+            state.system.block_difference(state.block_height()),
+            None,
+            "a difference was computed against a height nobody read"
+        );
+
+        // A real zero still reads as a height.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.block_height(),
+            Some(0),
+            "a node at genesis lost its height"
+        );
+    }
+
+    #[test]
+    fn an_unread_height_does_not_refresh_the_block_clock() {
+        // last_block_time is what the display leans on to say a node has gone
+        // quiet. A scrape that carried no readable height has not seen a block,
+        // so it must not reset that clock -- otherwise a wedged exporter looks
+        // like a node that is still producing.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(4200),
+            ..Default::default()
+        });
+        let seen_at = state.last_block_time;
+        assert_eq!(state.last_block_number, 4200);
+        assert!(seen_at.is_some());
+
+        state.update_metrics(PrometheusMetrics {
+            block_num: None,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            state.last_block_number, 4200,
+            "an unread height moved the height"
+        );
+        assert_eq!(
+            state.last_block_time, seen_at,
+            "an unread height refreshed the last-block clock"
+        );
+    }
+
+    #[test]
+    fn a_height_that_did_not_advance_leaves_the_block_clock_alone() {
+        // The clock marks when a NEW block was seen. A scrape that repeats the
+        // height, or reports an older one, has not seen one -- and a repeated
+        // height is the normal case between blocks, so getting this wrong would
+        // make every poll look like a block.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(4200),
+            ..Default::default()
+        });
+        let seen_at = state.last_block_time;
+
+        for height in [4200, 4199, 0] {
+            state.update_metrics(PrometheusMetrics {
+                block_num: Some(height),
+                ..Default::default()
+            });
+            assert_eq!(state.last_block_number, 4200, "{} moved the height", height);
+            assert_eq!(
+                state.last_block_time, seen_at,
+                "{} refreshed the clock",
+                height
+            );
+        }
+
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(4201),
+            ..Default::default()
+        });
+        assert_eq!(state.last_block_number, 4201);
+        assert_ne!(
+            state.last_block_time, seen_at,
+            "a new block did not move the clock"
+        );
+    }
+
+    #[test]
+    fn a_real_move_between_two_latency_readings_sets_the_trend() {
+        // Both comparisons, both boundaries. The threshold is 20ms and the test
+        // pins that exactly 20 is NOT a move, so turning either `>` into `>=`
+        // fails here rather than passing quietly.
+        for (prev, current, expected) in [
+            (100u64, 121u64, 1i8), // a rise past the threshold
+            (100, 120, 0),         // exactly the threshold is not a move
+            (100, 110, 0),         // inside the threshold
+            (121, 100, -1),        // a fall past the threshold
+            (120, 100, 0),         // exactly the threshold, the other way
+            (100, 100, 0),         // no move at all
+        ] {
+            let mut state = AppState::new();
+            state.update_metrics(PrometheusMetrics {
+                latency_p99_ms: Some(prev),
+                ..Default::default()
+            });
+            state.update_metrics(PrometheusMetrics {
+                latency_p99_ms: Some(current),
+                ..Default::default()
+            });
+
+            assert_eq!(
+                state.latency_trend(),
+                expected,
+                "{}ms -> {}ms",
+                prev,
+                current
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_latency_draws_no_trend() {
+        // Same rule as the peer trend: two real readings or no arrow. Treating
+        // an unknown as zero would draw an improvement on the first reading and
+        // a worsening the moment the metric came back.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            latency_p99_ms: Some(400),
+            ..Default::default()
+        });
+        assert_eq!(state.latency_trend(), 0, "no previous reading to compare");
+
+        state.update_metrics(PrometheusMetrics {
+            latency_p99_ms: None,
+            ..Default::default()
+        });
+        assert_eq!(state.latency_trend(), 0, "current reading is unknown");
+
+        state.update_metrics(PrometheusMetrics {
+            latency_p99_ms: Some(40),
+            ..Default::default()
+        });
+        assert_eq!(state.latency_trend(), 0, "the previous reading was unknown");
+
+        state.update_metrics(PrometheusMetrics {
+            latency_p99_ms: Some(400),
+            ..Default::default()
+        });
+        assert_eq!(state.latency_trend(), 1, "a real move between two readings");
+    }
+
+    #[test]
     fn an_unknown_peer_count_draws_no_trend() {
         // peers_prev starts unknown, so the first real reading has nothing to
         // compare against; treating unknown as 0 would draw a rising arrow on
@@ -584,7 +778,7 @@ mod tests {
         assert_eq!(state.peers_trend(), 0, "no previous reading to compare");
 
         state.update_metrics(PrometheusMetrics {
-            block_num: 100,
+            block_num: Some(100),
             ..Default::default()
         });
         assert_eq!(state.peers_trend(), 0, "current reading is unknown");
@@ -621,16 +815,16 @@ mod tests {
             ..Default::default()
         });
         state.update_metrics(PrometheusMetrics {
-            block_num: 100,
+            block_num: Some(100),
             ..Default::default()
         });
         // While the subscription is up its height leads.
-        assert_eq!(state.block_height(), 90);
+        assert_eq!(state.block_height(), Some(90));
 
         state.set_ws_disconnected("gone".to_string());
-        assert_eq!(state.block_height(), 100);
+        assert_eq!(state.block_height(), Some(100));
 
         state.set_ws_connected();
-        assert_eq!(state.block_height(), 90);
+        assert_eq!(state.block_height(), Some(90));
     }
 }

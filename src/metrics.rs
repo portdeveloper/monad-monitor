@@ -13,29 +13,45 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Metrics fetched from Prometheus endpoint
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PrometheusMetrics {
-    pub block_num: u64,
-    pub tx_commits: u64,
+    /// `None` when the scrape did not carry the metric, or carried a value that
+    /// is not a reading. Zero is a reading several of these can genuinely give,
+    /// so it cannot stand in for "unread": a node at genesis, an idle mempool
+    /// and a node with no upstream validators all report a real 0.
+    pub block_num: Option<u64>,
+    pub tx_commits: Option<u64>,
+    /// Milliseconds, or 0 when the counter it belongs to did not arrive. TPS is
+    /// a rate over that pair, so neither half is useful without the other.
     pub tx_commits_timestamp_ms: u64,
     /// `None` when the scrape did not carry `monad_peer_disc_num_peers`, or
     /// carried a value that would not parse. Zero is a reading a connected node
     /// can genuinely give, so reporting an unread field as one would raise a
     /// low-peer alert against a count nobody took.
     pub peer_count: Option<u64>,
-    pub statesync_progress: u64,
-    pub statesync_target: u64,
+    pub statesync_progress: Option<u64>,
+    pub statesync_target: Option<u64>,
     // New metrics
-    pub uptime_us: u64,
-    pub latency_p99_ms: u64,
-    pub pending_txs: u64,
-    pub upstream_validators: u64,
+    pub uptime_us: Option<u64>,
+    pub latency_p99_ms: Option<u64>,
+    pub pending_txs: Option<u64>,
+    pub upstream_validators: Option<u64>,
 }
 
 impl PrometheusMetrics {
+    /// How far a statesync has got, as a percentage.
+    ///
+    /// A node that is not statesyncing reports neither gauge, and that has
+    /// always meant "nothing left to sync" here. An unread gauge is not the
+    /// same thing: a progress figure with no target is a node that IS syncing
+    /// and whose target did not arrive, so it must not report completion. Only
+    /// the absence of both, or a target of zero, is evidence of a synced node.
     pub fn sync_percentage(&self) -> f64 {
-        if self.statesync_target == 0 {
-            100.0
-        } else {
-            (self.statesync_progress as f64 / self.statesync_target as f64) * 100.0
+        match (self.statesync_progress, self.statesync_target) {
+            (None, None) | (_, Some(0)) => 100.0,
+            (Some(progress), Some(target)) => (progress as f64 / target as f64) * 100.0,
+            // One half read and the other not: there is a statesync in flight
+            // and no way to say how far along. Not synced is the safe direction
+            // for a monitor.
+            (Some(_), None) | (None, Some(_)) => 0.0,
         }
     }
 
@@ -117,49 +133,53 @@ fn parse_metrics(body: &str) -> Result<PrometheusMetrics> {
             match name {
                 "monad_execution_ledger_block_num" => {
                     if let Some(block_num) = count(value) {
-                        metrics.block_num = block_num;
+                        metrics.block_num = Some(block_num);
                     }
                 }
                 "monad_execution_ledger_num_tx_commits" => {
                     // The timestamp rides with the counter: TPS is a rate over
                     // that pair, so keeping one without the other would date a
                     // count that never came with it.
+                    // The pair moves together, and a later line that is not a
+                    // reading must not strand the timestamp of one that was.
                     if let Some(tx_commits) = count(value) {
-                        metrics.tx_commits = tx_commits;
+                        metrics.tx_commits = Some(tx_commits);
                         metrics.tx_commits_timestamp_ms = timestamp;
                     }
                 }
                 "monad_peer_disc_num_peers" => {
-                    metrics.peer_count = count(value);
+                    if let Some(peer_count) = count(value) {
+                        metrics.peer_count = Some(peer_count);
+                    }
                 }
                 "monad_statesync_progress_estimate" => {
                     if let Some(statesync_progress) = count(value) {
-                        metrics.statesync_progress = statesync_progress;
+                        metrics.statesync_progress = Some(statesync_progress);
                     }
                 }
                 "monad_statesync_last_target" => {
                     if let Some(statesync_target) = count(value) {
-                        metrics.statesync_target = statesync_target;
+                        metrics.statesync_target = Some(statesync_target);
                     }
                 }
                 "monad_total_uptime_us" => {
                     if let Some(uptime_us) = count(value) {
-                        metrics.uptime_us = uptime_us;
+                        metrics.uptime_us = Some(uptime_us);
                     }
                 }
                 "monad_bft_raptorcast_udp_secondary_broadcast_latency_p99_ms" => {
                     if let Some(latency_p99_ms) = count(value) {
-                        metrics.latency_p99_ms = latency_p99_ms;
+                        metrics.latency_p99_ms = Some(latency_p99_ms);
                     }
                 }
                 "monad_bft_txpool_pool_tracked_txs" => {
                     if let Some(pending_txs) = count(value) {
-                        metrics.pending_txs = pending_txs;
+                        metrics.pending_txs = Some(pending_txs);
                     }
                 }
                 "monad_peer_disc_num_upstream_validators" => {
                     if let Some(upstream_validators) = count(value) {
-                        metrics.upstream_validators = upstream_validators;
+                        metrics.upstream_validators = Some(upstream_validators);
                     }
                 }
                 _ => {}
@@ -335,7 +355,7 @@ mod tests {
             .await
             .expect("a 200 with a valid body is a successful scrape");
 
-        assert_eq!(metrics.block_num, 41929095);
+        assert_eq!(metrics.block_num, Some(41929095));
     }
 
     #[tokio::test]
@@ -399,7 +419,7 @@ mod tests {
             .await
             .expect("the next scrape should reach a healthy endpoint");
 
-        assert_eq!(metrics.block_num, 41929095);
+        assert_eq!(metrics.block_num, Some(41929095));
     }
 
     #[test]
@@ -418,7 +438,7 @@ mod tests {
         let m = parse_metrics("monad_execution_ledger_block_num 100\n").expect("parse");
 
         assert_eq!(m.peer_count, None);
-        assert_eq!(m.block_num, 100);
+        assert_eq!(m.block_num, Some(100));
     }
 
     #[test]
@@ -431,7 +451,7 @@ mod tests {
         .expect("parse");
 
         assert_eq!(m.peer_count, None);
-        assert_eq!(m.block_num, 100);
+        assert_eq!(m.block_num, Some(100));
     }
 
     #[test]
@@ -468,7 +488,7 @@ mod tests {
             assert_eq!(m.peer_count, None, "{:?} was stored as a count", value);
             // The rest of the scrape is still good; one bad line is not a failed
             // scrape.
-            assert_eq!(m.block_num, 100, "{:?} lost the block height", value);
+            assert_eq!(m.block_num, Some(100), "{:?} lost the block height", value);
         }
     }
 
@@ -496,10 +516,11 @@ mod tests {
 
     /// Every field filled by casting a scraped float, and how to read it back.
     /// They all go through the same check, so the table is the test.
-    type Field = (&'static str, fn(&PrometheusMetrics) -> u64);
+    type Field = (&'static str, fn(&PrometheusMetrics) -> Option<u64>);
 
-    const CAST_FIELDS: [Field; 8] = [
+    const CAST_FIELDS: [Field; 9] = [
         ("monad_execution_ledger_block_num", |m| m.block_num),
+        ("monad_peer_disc_num_peers", |m| m.peer_count),
         ("monad_execution_ledger_num_tx_commits", |m| m.tx_commits),
         ("monad_statesync_progress_estimate", |m| {
             m.statesync_progress
@@ -515,6 +536,51 @@ mod tests {
             m.upstream_validators
         }),
     ];
+
+    #[test]
+    fn an_unread_statesync_gauge_reads_as_nothing_left_to_sync() {
+        // A node that is not statesyncing does not report a target, which has
+        // always meant "synced" here -- the field used to default to 0 and hit
+        // the same branch. Making it optional must not turn every healthy node
+        // into one stuck at 0%.
+        let nothing = PrometheusMetrics::default();
+        assert_eq!(nothing.sync_percentage(), 100.0);
+        assert!(nothing.is_synced());
+
+        let explicit_zero = PrometheusMetrics {
+            statesync_target: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(explicit_zero.sync_percentage(), 100.0);
+
+        // A real target still divides, and a node mid-sync is not synced.
+        let syncing = PrometheusMetrics {
+            statesync_progress: Some(500),
+            statesync_target: Some(1000),
+            ..Default::default()
+        };
+        assert_eq!(syncing.sync_percentage(), 50.0);
+        assert!(!syncing.is_synced());
+
+        // Either half read without the other is a sync in flight that cannot be
+        // measured. Both directions take the safe answer, and in particular a
+        // progress reading with an unread target must NOT report completion --
+        // that is a wedged gauge on a node that is demonstrably syncing.
+        for (progress, target) in [(None, Some(1000)), (Some(500), None)] {
+            let half = PrometheusMetrics {
+                statesync_progress: progress,
+                statesync_target: target,
+                ..Default::default()
+            };
+            assert_eq!(half.sync_percentage(), 0.0, "{:?}/{:?}", progress, target);
+            assert!(
+                !half.is_synced(),
+                "{:?}/{:?} claimed synced",
+                progress,
+                target
+            );
+        }
+    }
 
     #[test]
     fn a_value_that_is_not_a_reading_is_not_stored() {
@@ -546,15 +612,23 @@ mod tests {
                 // on the way in and arrives indistinguishable from the row above.
                 "18446744073709551615",
             ] {
-                let body = format!("monad_peer_disc_num_peers 12\n{} {}\n", metric, value);
+                // The witness has to be a metric this row is not testing, now
+                // that every field goes through the same check.
+                let (witness, witness_read): (&str, fn(&PrometheusMetrics) -> Option<u64>) =
+                    if metric == "monad_execution_ledger_block_num" {
+                        ("monad_peer_disc_num_peers", |m| m.peer_count)
+                    } else {
+                        ("monad_execution_ledger_block_num", |m| m.block_num)
+                    };
+                let body = format!("{} 100\n{} {}\n", witness, metric, value);
                 let m = parse_metrics(&body).expect("parse");
 
-                assert_eq!(field(&m), 0, "{} {:?} was stored", metric, value);
+                assert_eq!(field(&m), None, "{} {:?} was stored", metric, value);
                 // One line that is not a reading is not a failed scrape.
                 assert_eq!(
-                    m.peer_count,
-                    Some(12),
-                    "{} {:?} cost the rest",
+                    witness_read(&m),
+                    Some(100),
+                    "{} {:?} cost the rest of the scrape",
                     metric,
                     value
                 );
@@ -584,24 +658,82 @@ mod tests {
                 let body = format!("{} {}\n", metric, value);
                 let m = parse_metrics(&body).expect("parse");
 
-                assert_eq!(field(&m), expected, "{} {:?} was refused", metric, value);
+                assert_eq!(
+                    field(&m),
+                    Some(expected),
+                    "{} {:?} was refused",
+                    metric,
+                    value
+                );
             }
         }
     }
 
     #[test]
     fn a_zero_reading_is_stored_and_not_merely_the_default() {
-        // These fields are plain u64, so a refused value and a real zero both
-        // leave 0 behind and the table above cannot tell them apart. Writing a
-        // non-zero first and then a zero in the same body is what proves the
-        // zero was taken: if the check ever started refusing 0 -- `value <= 0.0`
-        // is one character away -- the earlier value would survive here.
+        // Some(0) and None are now distinguishable, so this no longer has to
+        // prove a zero was taken rather than defaulted. It still guards the
+        // check itself: `value <= 0.0` is one character away from `< 0.0`.
         for (metric, field) in CAST_FIELDS {
             let body = format!("{} 7\n{} 0\n", metric, metric);
             let m = parse_metrics(&body).expect("parse");
 
-            assert_eq!(field(&m), 0, "{} refused a real zero", metric);
+            assert_eq!(field(&m), Some(0), "{} refused a real zero", metric);
         }
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_reading_does_not_erase_one_that_was() {
+        // Duplicate names are not supposed to happen, but a proxy or a
+        // federation endpoint can produce them. A later line that is refused
+        // must leave the earlier reading standing rather than blanking it --
+        // and for tx_commits it must not strand the timestamp either, or the
+        // JSON shows a time against a count that is not there.
+        // Every refusal class, not just NaN: a parser that special-cased one of
+        // them and clobbered on the rest would pass a NaN-only version of this.
+        for (metric, field) in CAST_FIELDS {
+            for bad in ["NaN", "-1", "1.5", "+Inf", "1e309", "18446744073709551616"] {
+                // A witness the row is not testing, so a refused line that
+                // reached past its own field would show up here.
+                let (witness, witness_read): (&str, fn(&PrometheusMetrics) -> Option<u64>) =
+                    if metric == "monad_peer_disc_num_peers" {
+                        ("monad_execution_ledger_block_num", |m| m.block_num)
+                    } else {
+                        ("monad_peer_disc_num_peers", |m| m.peer_count)
+                    };
+                let body = format!("{} 42\n{} 7\n{} {}\n", witness, metric, metric, bad);
+                let m = parse_metrics(&body).expect("parse");
+
+                assert_eq!(field(&m), Some(7), "{} erased by {:?}", metric, bad);
+                assert_eq!(
+                    witness_read(&m),
+                    Some(42),
+                    "{} {:?} took the witness with it",
+                    metric,
+                    bad
+                );
+            }
+
+            // The other order: refused first, then a real reading, which wins.
+            let body = format!("{} NaN\n{} 7\n", metric, metric);
+            let m = parse_metrics(&body).expect("parse");
+            assert_eq!(
+                field(&m),
+                Some(7),
+                "{} lost a reading that came after a refusal",
+                metric
+            );
+        }
+
+        // The refused line carries its OWN timestamp, so this also pins that a
+        // kept count is not re-dated by a reading that was thrown away.
+        let m = parse_metrics(
+            "monad_execution_ledger_num_tx_commits 99 2000\n\
+             monad_execution_ledger_num_tx_commits NaN 9999\n",
+        )
+        .expect("parse");
+        assert_eq!(m.tx_commits, Some(99));
+        assert_eq!(m.tx_commits_timestamp_ms, 2000, "the pair came apart");
     }
 
     #[test]
@@ -612,11 +744,11 @@ mod tests {
         // has committed nothing.
         let refused =
             parse_metrics("monad_execution_ledger_num_tx_commits NaN 2000\n").expect("parse");
-        assert_eq!(refused.tx_commits, 0);
+        assert_eq!(refused.tx_commits, None);
         assert_eq!(refused.tx_commits_timestamp_ms, 0);
 
         let read = parse_metrics("monad_execution_ledger_num_tx_commits 99 2000\n").expect("parse");
-        assert_eq!(read.tx_commits, 99);
+        assert_eq!(read.tx_commits, Some(99));
         assert_eq!(read.tx_commits_timestamp_ms, 2000);
     }
 

@@ -30,7 +30,9 @@ pub struct Snapshot {
     pub timestamp_ms: u64,
     pub network: String,
     pub node_reachable: bool,
-    pub block_height: u64,
+    /// `null` when neither the RPC nor the metrics scrape reported a height, so
+    /// a script can tell a node at genesis from one that has not been read.
+    pub block_height: Option<u64>,
     pub synced: bool,
     pub sync_percentage: f64,
     pub tps: f64,
@@ -232,12 +234,50 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_metric_serializes_as_null_rather_than_zero() {
+        // Same contract #37 set for the monad-mpt readings and #40 for the peer
+        // count: a script has to be able to tell a real zero from no reading.
+        // Several of these can genuinely be zero on a healthy node.
+        let state = AppState::new();
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", false)).unwrap();
+
+        for field in [
+            "block_num",
+            "tx_commits",
+            "statesync_progress",
+            "statesync_target",
+            "uptime_us",
+            "latency_p99_ms",
+            "pending_txs",
+            "upstream_validators",
+        ] {
+            assert!(
+                v[field].is_null(),
+                "{} was invented before any scrape",
+                field
+            );
+        }
+
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(0),
+            pending_txs: Some(9),
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+
+        assert_eq!(v["block_num"], 0, "a real zero stopped being a reading");
+        assert_eq!(v["pending_txs"], 9);
+        assert!(v["uptime_us"].is_null(), "an unread field became a number");
+    }
+
+    #[test]
     fn an_unknown_peer_count_serializes_as_null_rather_than_zero() {
         // A scrape that omitted the metric must not reach a JSON consumer as a
         // node with no peers. A real zero still has to survive as zero.
         let mut state = AppState::new();
         state.update_metrics(PrometheusMetrics {
-            block_num: 100,
+            block_num: Some(100),
             ..Default::default()
         });
         let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();

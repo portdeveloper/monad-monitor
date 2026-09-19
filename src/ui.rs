@@ -246,7 +246,10 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
     let block_text = vec![
         Line::from(Span::styled("BLOCK HEIGHT", Style::default().fg(label_color))),
         Line::from(Span::styled(
-            format_number(block_num),
+            match block_num {
+                Some(height) => format_number(height),
+                None => "...".to_string(),
+            },
             Style::default()
                 .fg(alert_or(state, AlertKind::NoBlock, value_color))
                 .bold(),
@@ -321,12 +324,13 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
     // Latency (p99) with trend
     let latency = state.metrics.latency_p99_ms;
     let latency_trend = state.latency_trend();
-    let latency_color = if latency < 100 {
-        Color::Green
-    } else if latency < 500 {
-        Color::Yellow
-    } else {
-        Color::Red
+    // An unread latency is not a fast one: it takes the muted label colour the
+    // other unknowns use rather than the green a low number would earn.
+    let latency_color = match latency {
+        Some(ms) if ms < 100 => Color::Green,
+        Some(ms) if ms < 500 => Color::Yellow,
+        Some(_) => Color::Red,
+        None => label_color,
     };
 
     // For latency: up arrow = bad (red), down arrow = good (green)
@@ -339,7 +343,13 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
     let latency_text = vec![
         Line::from(Span::styled("LATENCY", Style::default().fg(label_color))),
         Line::from(vec![
-            Span::styled(format!("{}ms", latency), Style::default().fg(latency_color).bold()),
+            Span::styled(
+                match latency {
+                    Some(ms) => format!("{}ms", ms),
+                    None => "...".to_string(),
+                },
+                Style::default().fg(latency_color).bold(),
+            ),
             Span::styled(format!(" {}", trend_arrow), Style::default().fg(trend_color)),
         ]),
         Line::from(Span::styled("p99", Style::default().fg(label_color))),
