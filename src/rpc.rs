@@ -13,7 +13,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The opening requests either come back promptly or the endpoint is not
-/// usable, and waiting forever on them hides the problem.
+/// usable, and waiting forever on them hides the problem. The same window
+/// bounds the connect itself (TCP, TLS, upgrade): an endpoint that accepts
+/// the socket and never answers the upgrade is not usable either.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reconnect delay, doubling up to the ceiling. A node that is down stays down
@@ -192,8 +194,28 @@ impl RpcClient {
 /// live and streaming before it dropped, which is what tells the caller the
 /// endpoint itself is fine.
 async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result<bool> {
-    let (ws_stream, _) = connect_async(endpoint)
+    run_subscription_with(endpoint, tx, HANDSHAKE_TIMEOUT).await
+}
+
+/// `run_subscription` with the connect deadline as a parameter, so a test does
+/// not have to wait out `HANDSHAKE_TIMEOUT` to see a stalled connect fail.
+async fn run_subscription_with(
+    endpoint: &str,
+    tx: &mpsc::Sender<RpcEvent>,
+    connect_timeout: Duration,
+) -> Result<bool> {
+    // The reads after the upgrade have deadlines; the connect itself did not,
+    // so an endpoint that accepts the socket and never answers the upgrade
+    // parked this task for good and the caller's backoff loop never ran.
+    let (ws_stream, _) = tokio::time::timeout(connect_timeout, connect_async(endpoint))
         .await
+        .map_err(|_| {
+            anyhow!(
+                "connecting to {} timed out after {}s",
+                endpoint,
+                connect_timeout.as_secs_f32()
+            )
+        })?
         .with_context(|| format!("Failed to connect to {}", endpoint))?;
 
     let (mut write, mut read) = ws_stream.split();
@@ -718,5 +740,159 @@ mod tests {
         let numbers: Vec<u64> = blocks.iter().map(|b| b.number).collect();
         assert_eq!(numbers, vec![199]);
         assert_eq!(blocks[0].tx_count, 2);
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// An endpoint whose kernel accepts the socket and whose process never
+    /// answers the WebSocket upgrade. Accepted streams are parked, not
+    /// dropped: a closed socket would fail the connect at once, which is not
+    /// the hang this guards against. Dropping the guard stops the thread.
+    struct HeldListener {
+        addr: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeldListener {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let addr = listener.local_addr().expect("read local addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for stream in listener.incoming() {
+                    if flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Ok(stream) = stream {
+                        held.push(stream);
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("ws://{}", self.addr)
+        }
+    }
+
+    impl Drop for HeldListener {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake the accept loop so it sees the flag, then wait for it.
+            let _ = std::net::TcpStream::connect(self.addr);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// A server that answers the upgrade and the opening requests, stays
+    /// quiet for `quiet` before closing, then drains until the client is
+    /// gone. Block number 0 keeps the backfill out of the picture.
+    fn healthy_server(quiet: Duration) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("read local addr");
+        let thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut ws = tokio_tungstenite::tungstenite::accept(stream).expect("upgrade");
+            let mut answered = 0;
+            while answered < 3 {
+                if let Message::Text(text) = ws.read().expect("read an opening request") {
+                    let req: Value = serde_json::from_str(&text).expect("json request");
+                    let id = req["id"].as_u64().expect("request id");
+                    let result = match id {
+                        0 => "0x0",
+                        1 => "0x3b9aca00",
+                        _ => "MockNode/0.1",
+                    };
+                    ws.send(Message::Text(
+                        json!({"id": id, "result": result}).to_string(),
+                    ))
+                    .expect("send reply");
+                    answered += 1;
+                }
+            }
+            let _ = ws.read().expect("read the subscribe request");
+            std::thread::sleep(quiet);
+            let _ = ws.close(None);
+            while ws.read().is_ok() {}
+        });
+        (addr, thread)
+    }
+
+    #[tokio::test]
+    async fn a_connect_that_never_completes_fails_by_its_deadline() {
+        // Without a deadline on the connect this test does not fail, it hangs:
+        // the outer timeout is what turns a regression into a red test.
+        let server = HeldListener::start();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_subscription_with(&server.url(), &tx, Duration::from_millis(250)),
+        )
+        .await
+        .expect("the connect must fail by its own deadline, not hang");
+
+        let err = outcome.expect_err("an upgrade that never completes is not a connection");
+        let text = format!("{:#}", err);
+        assert!(
+            text.contains("timed out"),
+            "should read as a timeout: {text}"
+        );
+        assert!(
+            text.contains(&server.addr.to_string()),
+            "should name the endpoint: {text}"
+        );
+        // The caller turns the error into `Disconnected`; the function itself
+        // sends nothing before the stream is up.
+        assert!(rx.try_recv().is_err());
+
+        // A later connect to an endpoint that does answer still works.
+        let (addr, thread) = healthy_server(Duration::from_millis(50));
+        let later = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_subscription_with(&format!("ws://{addr}"), &tx, Duration::from_millis(250)),
+        )
+        .await
+        .expect("a healthy endpoint must not hang either");
+        let _ = thread.join();
+        assert!(
+            matches!(later, Ok(true)),
+            "the later connect should stream: {later:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_upgrade_is_not_cut_off_by_the_connect_deadline() {
+        // The server answers the upgrade and the opening requests, then stays
+        // quiet for longer than the connect deadline before closing: the
+        // deadline must stop counting once the upgrade is done.
+        let (addr, thread) = healthy_server(Duration::from_millis(600));
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_subscription_with(&format!("ws://{addr}"), &tx, Duration::from_millis(250)),
+        )
+        .await
+        .expect("a server that closes after the upgrade must not hang the client");
+        let _ = thread.join();
+
+        assert!(
+            matches!(outcome, Ok(true)),
+            "the connection should have streamed: {outcome:?}"
+        );
+        assert!(matches!(rx.try_recv(), Ok(RpcEvent::Data(_))));
+        assert!(matches!(rx.try_recv(), Ok(RpcEvent::Connected)));
     }
 }
