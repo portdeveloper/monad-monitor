@@ -116,32 +116,51 @@ fn parse_metrics(body: &str) -> Result<PrometheusMetrics> {
         if let Some((name, value, timestamp)) = parse_metric_line(line) {
             match name {
                 "monad_execution_ledger_block_num" => {
-                    metrics.block_num = value as u64;
+                    if let Some(block_num) = count(value) {
+                        metrics.block_num = block_num;
+                    }
                 }
                 "monad_execution_ledger_num_tx_commits" => {
-                    metrics.tx_commits = value as u64;
-                    metrics.tx_commits_timestamp_ms = timestamp;
+                    // The timestamp rides with the counter: TPS is a rate over
+                    // that pair, so keeping one without the other would date a
+                    // count that never came with it.
+                    if let Some(tx_commits) = count(value) {
+                        metrics.tx_commits = tx_commits;
+                        metrics.tx_commits_timestamp_ms = timestamp;
+                    }
                 }
                 "monad_peer_disc_num_peers" => {
-                    metrics.peer_count = peer_count(value);
+                    metrics.peer_count = count(value);
                 }
                 "monad_statesync_progress_estimate" => {
-                    metrics.statesync_progress = value as u64;
+                    if let Some(statesync_progress) = count(value) {
+                        metrics.statesync_progress = statesync_progress;
+                    }
                 }
                 "monad_statesync_last_target" => {
-                    metrics.statesync_target = value as u64;
+                    if let Some(statesync_target) = count(value) {
+                        metrics.statesync_target = statesync_target;
+                    }
                 }
                 "monad_total_uptime_us" => {
-                    metrics.uptime_us = value as u64;
+                    if let Some(uptime_us) = count(value) {
+                        metrics.uptime_us = uptime_us;
+                    }
                 }
                 "monad_bft_raptorcast_udp_secondary_broadcast_latency_p99_ms" => {
-                    metrics.latency_p99_ms = value as u64;
+                    if let Some(latency_p99_ms) = count(value) {
+                        metrics.latency_p99_ms = latency_p99_ms;
+                    }
                 }
                 "monad_bft_txpool_pool_tracked_txs" => {
-                    metrics.pending_txs = value as u64;
+                    if let Some(pending_txs) = count(value) {
+                        metrics.pending_txs = pending_txs;
+                    }
                 }
                 "monad_peer_disc_num_upstream_validators" => {
-                    metrics.upstream_validators = value as u64;
+                    if let Some(upstream_validators) = count(value) {
+                        metrics.upstream_validators = upstream_validators;
+                    }
                 }
                 _ => {}
             }
@@ -151,15 +170,15 @@ fn parse_metrics(body: &str) -> Result<PrometheusMetrics> {
     Ok(metrics)
 }
 
-/// A peer count read off the wire, or `None` when the number was not one.
+/// A counter or gauge read off the wire, or `None` when the number was not one.
 ///
 /// Prometheus carries every value as a float, so a line can parse cleanly and
-/// still not be a count. `as u64` would turn `NaN` and any negative into 0 --
-/// the reading a node with no peers gives, which is exactly the confusion this
-/// field was made optional to end -- saturate an infinity to `u64::MAX`, and
-/// truncate `1.5` to 1. A count that is not whole, not finite, negative or past
-/// the end of the type was never a measurement, so it stays unknown.
-fn peer_count(value: f64) -> Option<u64> {
+/// still not be a reading. `as u64` cannot fail: it turns `NaN` and any negative
+/// into 0, saturates an infinity to `u64::MAX`, and truncates `1.5` to 1, so
+/// each of those lands in the struct looking measured. The node keeps its own
+/// metrics in a `HashMap<&'static str, u64>`, so a value that is not whole, not
+/// finite, negative or past the end of the type is not one it can export.
+fn count(value: f64) -> Option<u64> {
     // `is_finite` is deliberately explicit rather than load-bearing: no input can
     // reach the arms behind it, since `-Inf` is already negative and both `NaN`
     // and `+Inf` have a `fract()` of `NaN`, which is not equal to 0.0. Rejecting
@@ -170,8 +189,8 @@ fn peer_count(value: f64) -> Option<u64> {
         return None;
     }
     // 2^64, the first f64 past `u64::MAX`. Without this the cast saturates and
-    // hands back `u64::MAX` as though it had been measured; that value also
-    // overflows the peer-trend arithmetic in `state.rs`.
+    // hands back `u64::MAX` as though it had been measured; for the peer count
+    // that value also overflows the trend arithmetic in `state.rs`.
     const ABOVE_U64_MAX: f64 = 18_446_744_073_709_551_616.0;
     if value >= ABOVE_U64_MAX {
         return None;
@@ -473,6 +492,132 @@ mod tests {
             let m = parse_metrics(&body).expect("parse");
             assert_eq!(m.peer_count, Some(expected), "{:?} was refused", value);
         }
+    }
+
+    /// Every field filled by casting a scraped float, and how to read it back.
+    /// They all go through the same check, so the table is the test.
+    type Field = (&'static str, fn(&PrometheusMetrics) -> u64);
+
+    const CAST_FIELDS: [Field; 8] = [
+        ("monad_execution_ledger_block_num", |m| m.block_num),
+        ("monad_execution_ledger_num_tx_commits", |m| m.tx_commits),
+        ("monad_statesync_progress_estimate", |m| {
+            m.statesync_progress
+        }),
+        ("monad_statesync_last_target", |m| m.statesync_target),
+        ("monad_total_uptime_us", |m| m.uptime_us),
+        (
+            "monad_bft_raptorcast_udp_secondary_broadcast_latency_p99_ms",
+            |m| m.latency_p99_ms,
+        ),
+        ("monad_bft_txpool_pool_tracked_txs", |m| m.pending_txs),
+        ("monad_peer_disc_num_upstream_validators", |m| {
+            m.upstream_validators
+        }),
+    ];
+
+    #[test]
+    fn a_value_that_is_not_a_reading_is_not_stored() {
+        // `as u64` cannot fail, so each of these used to land in the struct
+        // looking measured: NaN and the negatives as 0, the infinities and
+        // anything past the type as u64::MAX, a fraction truncated. The
+        // spellings matter as much as the values -- `1e309` carries none of the
+        // word in its text and still arrives as an infinity, so a check written
+        // against `inf` would let it through.
+        for (metric, field) in CAST_FIELDS {
+            for value in [
+                "NaN",
+                "nan",
+                "-1",
+                "-0.5",
+                "1.5",
+                "0.1",
+                "inf",
+                "Inf",
+                "INF",
+                "+inf",
+                "infinity",
+                "Infinity",
+                "-inf",
+                "1e309",
+                "1e20",
+                "18446744073709551616",
+                // u64::MAX itself: no f64 holds it, so the text rounds to 2^64
+                // on the way in and arrives indistinguishable from the row above.
+                "18446744073709551615",
+            ] {
+                let body = format!("monad_peer_disc_num_peers 12\n{} {}\n", metric, value);
+                let m = parse_metrics(&body).expect("parse");
+
+                assert_eq!(field(&m), 0, "{} {:?} was stored", metric, value);
+                // One line that is not a reading is not a failed scrape.
+                assert_eq!(
+                    m.peer_count,
+                    Some(12),
+                    "{} {:?} cost the rest",
+                    metric,
+                    value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_real_reading_is_stored() {
+        // The check must not swallow values that ARE readings, including a zero
+        // and the exponent and trailing-point forms an exporter may use.
+        for (metric, field) in CAST_FIELDS {
+            for (value, expected) in [
+                ("0", 0u64),
+                ("-0", 0),
+                ("7", 7),
+                ("1e2", 100),
+                ("5.", 5),
+                // Large but exactly representable, so it survives the f64 the
+                // metric line is carried in. 2^53 is where that stops in general.
+                ("9007199254740992", 9_007_199_254_740_992),
+                // The largest integer an f64 holds below 2^64. If ABOVE_U64_MAX
+                // were set even slightly low, a legal large gauge would be
+                // refused and nothing else here would notice.
+                ("18446744073709549568", 18_446_744_073_709_549_568),
+            ] {
+                let body = format!("{} {}\n", metric, value);
+                let m = parse_metrics(&body).expect("parse");
+
+                assert_eq!(field(&m), expected, "{} {:?} was refused", metric, value);
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_reading_is_stored_and_not_merely_the_default() {
+        // These fields are plain u64, so a refused value and a real zero both
+        // leave 0 behind and the table above cannot tell them apart. Writing a
+        // non-zero first and then a zero in the same body is what proves the
+        // zero was taken: if the check ever started refusing 0 -- `value <= 0.0`
+        // is one character away -- the earlier value would survive here.
+        for (metric, field) in CAST_FIELDS {
+            let body = format!("{} 7\n{} 0\n", metric, metric);
+            let m = parse_metrics(&body).expect("parse");
+
+            assert_eq!(field(&m), 0, "{} refused a real zero", metric);
+        }
+    }
+
+    #[test]
+    fn the_commit_timestamp_does_not_outlive_the_count_it_came_with() {
+        // TPS is a rate over the counter and its timestamp. Taking the timestamp
+        // of a reading that was refused would date a count that never came with
+        // it, and a zero counter against a fresh timestamp reads as a node that
+        // has committed nothing.
+        let refused =
+            parse_metrics("monad_execution_ledger_num_tx_commits NaN 2000\n").expect("parse");
+        assert_eq!(refused.tx_commits, 0);
+        assert_eq!(refused.tx_commits_timestamp_ms, 0);
+
+        let read = parse_metrics("monad_execution_ledger_num_tx_commits 99 2000\n").expect("parse");
+        assert_eq!(read.tx_commits, 99);
+        assert_eq!(read.tx_commits_timestamp_ms, 2000);
     }
 
     #[test]
