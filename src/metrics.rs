@@ -227,9 +227,35 @@ fn parse_metric_line(line: &str) -> Option<(&str, f64, u64)> {
 mod tests {
     use super::*;
 
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     /// Short enough to keep the stalled-endpoint tests fast, long enough that a
     /// loopback response is never mistaken for a hang.
     const TEST_TIMEOUT: Duration = Duration::from_millis(250);
+
+    /// The assertion's own bound, deliberately written as its own literal rather
+    /// than derived from `TEST_TIMEOUT` or `FETCH_TIMEOUT`. These tests exist to
+    /// prove the client stops on its own; an outer bound computed from the very
+    /// deadline under test would move with it, so removing that deadline would
+    /// widen the assertion instead of failing it. Generous on purpose: it is not
+    /// a performance budget, it is the line between "slow" and "never".
+    const ASSERTION_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Await a scrape that is supposed to end by itself, and fail the test if it
+    /// does not. Without this the stalled-endpoint tests hang until the CI job's
+    /// own timeout, which reports as a job that ran out of time rather than as
+    /// the regression it is.
+    async fn before_deadline<F: Future>(what: &str, scrape: F) -> F::Output {
+        match timeout(ASSERTION_DEADLINE, scrape).await {
+            Ok(finished) => finished,
+            Err(_) => panic!(
+                "{what}: the scrape did not end within {ASSERTION_DEADLINE:?}, so the client is \
+                 no longer bounding a stalled endpoint"
+            ),
+        }
+    }
 
     /// Serve exactly one HTTP response on a loopback port, then return its URL.
     /// A plain `std::net::TcpListener` on a background thread keeps this test free of
@@ -259,16 +285,35 @@ mod tests {
     /// `None` stalls on the headers, a header block with an unfilled
     /// `Content-Length` stalls on the body. Once `stalls` connections have been
     /// parked, the next one is answered with `response`.
-    fn serve_stalling(stalls: usize, partial: Option<String>, response: String) -> String {
+    fn serve_stalling(stalls: usize, partial: Option<String>, response: String) -> StallingEndpoint {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("read local addr");
-        std::thread::spawn(move || {
+        // Polled rather than blocked on, so the thread can notice the guard going
+        // away. `incoming()` parks inside accept() and would keep this thread and
+        // every parked socket alive for the rest of the test binary.
+        listener
+            .set_nonblocking(true)
+            .expect("poll the listener so the fixture can be shut down");
+        let stop = Arc::new(AtomicBool::new(false));
+        let watch = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
             let mut stalled = 0usize;
             let mut held = Vec::new();
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
+            while !watch.load(Ordering::Relaxed) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                // The listener polls; a connection that arrived should be read the
+                // ordinary way, and never past the point where the test is over.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(ASSERTION_DEADLINE));
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
                 if stalled < stalls {
@@ -286,8 +331,40 @@ mod tests {
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
             }
+            // Dropping `held` here is what finally closes the parked sockets.
         });
-        format!("http://{addr}/metrics")
+        StallingEndpoint {
+            url: format!("http://{addr}/metrics"),
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Owns the stalling fixture so the test owns its lifetime. Dropping it stops
+    /// the accept loop and closes every parked socket, and drop runs on the way
+    /// out of a failed assertion too, which is the case that used to leak: a
+    /// panicking test left its thread accepting and its sockets open.
+    struct StallingEndpoint {
+        url: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StallingEndpoint {
+        fn url(&self) -> &str {
+            &self.url
+        }
+    }
+
+    impl Drop for StallingEndpoint {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                // Joining rather than detaching: it is what makes the close ordered,
+                // so a later test cannot meet a socket this one was still holding.
+                let _ = thread.join();
+            }
+        }
     }
 
     fn http_response(status_line: &str, body: &str) -> String {
@@ -344,10 +421,12 @@ mod tests {
         // connection and then says nothing used to stop metrics for the session.
         let endpoint = serve_stalling(1, None, http_response("200 OK", ""));
 
-        let err = MetricsClient::with_timeout(&endpoint, TEST_TIMEOUT)
-            .fetch()
-            .await
-            .expect_err("an endpoint that never answers is not a successful scrape");
+        let err = before_deadline(
+            "a header stall",
+            MetricsClient::with_timeout(endpoint.url(), TEST_TIMEOUT).fetch(),
+        )
+        .await
+        .expect_err("an endpoint that never answers is not a successful scrape");
 
         assert!(
             err.to_string().contains("timed out"),
@@ -368,14 +447,42 @@ mod tests {
             http_response("200 OK", ""),
         );
 
-        let err = MetricsClient::with_timeout(&endpoint, TEST_TIMEOUT)
-            .fetch()
-            .await
-            .expect_err("a body that never arrives is not a successful scrape");
+        let err = before_deadline(
+            "a body stall",
+            MetricsClient::with_timeout(endpoint.url(), TEST_TIMEOUT).fetch(),
+        )
+        .await
+        .expect_err("a body that never arrives is not a successful scrape");
 
         assert!(
             err.to_string().contains("timed out"),
             "the failure should read as a timeout, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_stalling_fixture_closes_when_the_test_is_over() {
+        // The cleanup the two tests above depend on, asserted directly rather than
+        // assumed: while the guard is alive the port accepts, and once it is
+        // dropped the listener is gone and the parked socket with it. Without this
+        // a future change could quietly go back to detaching the thread, and every
+        // test here would still pass while leaking a listener per run.
+        let endpoint = serve_stalling(1, None, http_response("200 OK", ""));
+        let addr = endpoint
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/metrics")
+            .to_string();
+
+        std::net::TcpStream::connect(&addr).expect("the fixture accepts while the test holds it");
+        drop(endpoint);
+
+        // The accept loop polls on a 5 ms tick, so give it a moment to notice the
+        // flag before reading anything into a connection that races it.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            std::net::TcpStream::connect(&addr).is_err(),
+            "the fixture kept listening on {addr} after the test that owned it ended"
         );
     }
 
@@ -391,11 +498,12 @@ mod tests {
                 "monad_execution_ledger_block_num{job=\"test\"} 4.1929095e+07 1765694534456\n",
             ),
         );
-        let client = MetricsClient::with_timeout(&endpoint, TEST_TIMEOUT);
+        let client = MetricsClient::with_timeout(endpoint.url(), TEST_TIMEOUT);
 
-        client.fetch().await.expect_err("the first scrape stalls");
-        let metrics = client
-            .fetch()
+        before_deadline("the stalled first scrape", client.fetch())
+            .await
+            .expect_err("the first scrape stalls");
+        let metrics = before_deadline("the recovery scrape", client.fetch())
             .await
             .expect("the next scrape should reach a healthy endpoint");
 
