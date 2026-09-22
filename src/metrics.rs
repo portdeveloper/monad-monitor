@@ -29,6 +29,16 @@ pub struct PrometheusMetrics {
     pub peer_count: Option<u64>,
     pub statesync_progress: Option<u64>,
     pub statesync_target: Option<u64>,
+    /// A state-sync gauge that arrived without carrying a reading. The two
+    /// fields above stay `None`, because an unreadable value is not a
+    /// measurement -- but "the node never mentioned a statesync" and "the node
+    /// reported one and could not measure it" are opposite states, and only the
+    /// first is evidence of a synced node. Not serialized: the snapshot's key
+    /// set is a published contract, and this is an internal distinction.
+    #[serde(skip)]
+    pub statesync_progress_invalid: bool,
+    #[serde(skip)]
+    pub statesync_target_invalid: bool,
     // New metrics
     pub uptime_us: Option<u64>,
     pub latency_p99_ms: Option<u64>,
@@ -45,8 +55,20 @@ impl PrometheusMetrics {
     /// and whose target did not arrive, so it must not report completion. Only
     /// the absence of both, or a target of zero, is evidence of a synced node.
     pub fn sync_percentage(&self) -> f64 {
+        // An explicit target of zero is decisive on its own: there is nothing
+        // left to sync, so the progress gauge has nothing to add either way.
+        // Taking it first also keeps the divisor below non-zero.
+        if self.statesync_target == Some(0) {
+            return 100.0;
+        }
+        // A gauge that arrived without a reading is evidence OF a statesync,
+        // not evidence of its absence, so it must never reach the arm that
+        // reads two missing gauges as a synced node.
+        if self.statesync_progress_invalid || self.statesync_target_invalid {
+            return 0.0;
+        }
         match (self.statesync_progress, self.statesync_target) {
-            (None, None) | (_, Some(0)) => 100.0,
+            (None, None) => 100.0,
             (Some(progress), Some(target)) => (progress as f64 / target as f64) * 100.0,
             // One half read and the other not: there is a statesync in flight
             // and no way to say how far along. Not synced is the safe direction
@@ -152,16 +174,36 @@ fn parse_metrics(body: &str) -> Result<PrometheusMetrics> {
                         metrics.peer_count = Some(peer_count);
                     }
                 }
-                "monad_statesync_progress_estimate" => {
-                    if let Some(statesync_progress) = count(value) {
+                "monad_statesync_progress_estimate" => match count(value) {
+                    // Last write wins on success, the contract #46 set: a
+                    // refused duplicate must not erase a reading already taken.
+                    Some(statesync_progress) => {
                         metrics.statesync_progress = Some(statesync_progress);
+                        metrics.statesync_progress_invalid = false;
                     }
-                }
-                "monad_statesync_last_target" => {
-                    if let Some(statesync_target) = count(value) {
+                    // Only a gauge with no reading at all is unmeasured, so the
+                    // flag does not depend on which line arrived first.
+                    None => {
+                        if metrics.statesync_progress.is_none() {
+                            metrics.statesync_progress_invalid = true;
+                        }
+                    }
+                },
+                "monad_statesync_last_target" => match count(value) {
+                    // Last write wins on success, the contract #46 set: a
+                    // refused duplicate must not erase a reading already taken.
+                    Some(statesync_target) => {
                         metrics.statesync_target = Some(statesync_target);
+                        metrics.statesync_target_invalid = false;
                     }
-                }
+                    // Only a gauge with no reading at all is unmeasured, so the
+                    // flag does not depend on which line arrived first.
+                    None => {
+                        if metrics.statesync_target.is_none() {
+                            metrics.statesync_target_invalid = true;
+                        }
+                    }
+                },
                 "monad_total_uptime_us" => {
                     if let Some(uptime_us) = count(value) {
                         metrics.uptime_us = Some(uptime_us);
@@ -762,5 +804,97 @@ mod tests {
     fn a_positive_peer_count_is_read() {
         let m = parse_metrics("monad_peer_disc_num_peers 12\n").expect("parse");
         assert_eq!(m.peer_count, Some(12));
+    }
+
+    #[test]
+    fn a_malformed_statesync_gauge_cannot_claim_completion() {
+        // portdeveloper, review of #49: `count()` maps an unreadable value to
+        // `None`, which used to be indistinguishable from a gauge the node
+        // never sent -- and "neither gauge" is the one shape that means synced.
+        // A node emitting NaN is a node that reported a statesync and failed to
+        // measure it, which is the opposite of nothing left to sync.
+        // Driven through the production parser, not a hand-built struct: the
+        // struct cannot express "present but not a reading", so a test that
+        // builds one cannot reach this bug at all.
+        for (name, body) in [
+            (
+                "both gauges malformed",
+                "monad_statesync_progress_estimate NaN\nmonad_statesync_last_target NaN\n",
+            ),
+            (
+                "progress malformed, target absent",
+                "monad_statesync_progress_estimate NaN\n",
+            ),
+            (
+                "target malformed, progress absent",
+                "monad_statesync_last_target NaN\n",
+            ),
+        ] {
+            let m = parse_metrics(body).expect("parse");
+            // The raw fields stay null: an unreadable value is not a reading.
+            assert_eq!(m.statesync_progress, None, "{}", name);
+            assert_eq!(m.statesync_target, None, "{}", name);
+            // But the derived status must not read them as absent.
+            assert_eq!(m.sync_percentage(), 0.0, "{}", name);
+            assert!(!m.is_synced(), "{}", name);
+        }
+    }
+
+    #[test]
+    fn a_refused_statesync_line_does_not_erase_a_reading_in_either_order() {
+        // Recording "this gauge had no reading" must not cost the contract #46
+        // set for every other field: last write wins on success, and a refused
+        // duplicate leaves an earlier good reading standing. The flag therefore
+        // means "mentioned and never measured", which is order-independent.
+        let good_then_bad = parse_metrics(
+            "monad_statesync_progress_estimate 500\nmonad_statesync_last_target 1000\n\
+             monad_statesync_progress_estimate NaN\n",
+        )
+        .expect("parse");
+        assert_eq!(good_then_bad.statesync_progress, Some(500));
+        assert_eq!(good_then_bad.sync_percentage(), 50.0);
+
+        let bad_then_good = parse_metrics(
+            "monad_statesync_progress_estimate NaN\nmonad_statesync_progress_estimate 500\n\
+             monad_statesync_last_target 1000\n",
+        )
+        .expect("parse");
+        assert_eq!(bad_then_good.statesync_progress, Some(500));
+        assert_eq!(bad_then_good.sync_percentage(), 50.0);
+
+        // The SAME two orders on the target gauge. Covering only the progress
+        // one left the target's guard unbound: a mutation that neutralised it
+        // survived the suite, because no fixture ever took that branch.
+        let target_good_then_bad = parse_metrics(
+            "monad_statesync_progress_estimate 500\nmonad_statesync_last_target 1000\n\
+             monad_statesync_last_target NaN\n",
+        )
+        .expect("parse");
+        assert_eq!(target_good_then_bad.statesync_target, Some(1000));
+        assert_eq!(target_good_then_bad.sync_percentage(), 50.0);
+
+        let target_bad_then_good = parse_metrics(
+            "monad_statesync_last_target NaN\nmonad_statesync_last_target 1000\n\
+             monad_statesync_progress_estimate 500\n",
+        )
+        .expect("parse");
+        assert_eq!(target_bad_then_good.statesync_target, Some(1000));
+        assert_eq!(target_bad_then_good.sync_percentage(), 50.0);
+
+        // An explicit zero target still means nothing left to sync, even beside
+        // a progress gauge that arrived unreadable.
+        let zero_target =
+            parse_metrics("monad_statesync_progress_estimate NaN\nmonad_statesync_last_target 0\n")
+                .expect("parse");
+        assert_eq!(zero_target.sync_percentage(), 100.0);
+        assert!(zero_target.is_synced());
+
+        // A malformed gauge beside a readable one is still a sync in flight.
+        let one_side = parse_metrics(
+            "monad_statesync_progress_estimate NaN\nmonad_statesync_last_target 1000\n",
+        )
+        .expect("parse");
+        assert_eq!(one_side.statesync_target, Some(1000));
+        assert_eq!(one_side.sync_percentage(), 0.0);
     }
 }
