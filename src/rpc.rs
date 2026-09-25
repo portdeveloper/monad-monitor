@@ -94,21 +94,18 @@ impl RpcClient {
                 // Every way out of a subscription is a disconnect, including
                 // the clean ones: a server-side close ends the stream just as
                 // surely as a transport error does.
-                let reason = match run_subscription(&endpoint, &tx).await {
-                    Ok(streamed) => {
-                        // Reaching the stream means the endpoint is healthy, so
-                        // the next retry starts from the short delay again.
-                        if streamed {
-                            backoff = RECONNECT_MIN;
-                        }
-                        "connection closed by the node".to_string()
-                    }
+                // Fresh on every attempt, so one good session cannot excuse the
+                // failures that follow it.
+                let mut streamed = false;
+                let reason = match run_subscription(&endpoint, &tx, &mut streamed).await {
+                    Ok(()) => "connection closed by the node".to_string(),
                     Err(e) => format!("{:#}", e),
                 };
                 let _ = tx.send(RpcEvent::Disconnected(reason)).await;
 
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RECONNECT_MAX);
+                let (wait, next) = reconnect_delays(backoff, streamed);
+                tokio::time::sleep(wait).await;
+                backoff = next;
             }
         })
     }
@@ -190,11 +187,24 @@ impl RpcClient {
     }
 }
 
-/// Runs one connection until it ends. `Ok(true)` means the subscription was
-/// live and streaming before it dropped, which is what tells the caller the
-/// endpoint itself is fine.
-async fn run_subscription(endpoint: &str, tx: &mpsc::Sender<RpcEvent>) -> Result<bool> {
-    run_subscription_with(endpoint, tx, HANDSHAKE_TIMEOUT).await
+/// The wait before the next reconnect, and the backoff to carry after it.
+/// Reaching the stream means the endpoint is healthy, so a session that
+/// streamed starts the schedule over however it ended: a reset or a read
+/// timeout after hours of streaming says nothing bad about the endpoint.
+fn reconnect_delays(backoff: Duration, streamed: bool) -> (Duration, Duration) {
+    let wait = if streamed { RECONNECT_MIN } else { backoff };
+    (wait, (wait * 2).min(RECONNECT_MAX))
+}
+
+/// Runs one connection until it ends. `streamed` is set once the subscription
+/// is live and stays set however the connection ends afterwards, which is what
+/// tells the caller the endpoint itself is fine.
+async fn run_subscription(
+    endpoint: &str,
+    tx: &mpsc::Sender<RpcEvent>,
+    streamed: &mut bool,
+) -> Result<()> {
+    run_subscription_with(endpoint, tx, HANDSHAKE_TIMEOUT, streamed).await
 }
 
 /// `run_subscription` with the connect deadline as a parameter, so a test does
@@ -203,7 +213,8 @@ async fn run_subscription_with(
     endpoint: &str,
     tx: &mpsc::Sender<RpcEvent>,
     connect_timeout: Duration,
-) -> Result<bool> {
+    streamed: &mut bool,
+) -> Result<()> {
     // The reads after the upgrade have deadlines; the connect itself did not,
     // so an endpoint that accepts the socket and never answers the upgrade
     // parked this task for good and the caller's backoff loop never ran.
@@ -295,6 +306,7 @@ async fn run_subscription_with(
 
     // Past this point the connection is established and streaming, which is
     // what the caller needs to know to reset its reconnect delay.
+    *streamed = true;
     let _ = tx.send(RpcEvent::Connected).await;
 
     // Process incoming messages
@@ -404,7 +416,7 @@ async fn run_subscription_with(
         }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 /// Collects one reply for each request id below `expected` and returns the
@@ -795,33 +807,42 @@ mod tests {
         }
     }
 
-    /// A server that answers the upgrade and the opening requests, stays
-    /// quiet for `quiet` before closing, then drains until the client is
-    /// gone. Block number 0 keeps the backfill out of the picture.
+    /// Accepts one client, answers the upgrade and the three opening requests,
+    /// and reads the subscribe request. Block number 0 keeps the backfill out
+    /// of the picture.
+    fn accept_subscriber(
+        listener: std::net::TcpListener,
+    ) -> tokio_tungstenite::tungstenite::WebSocket<std::net::TcpStream> {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut ws = tokio_tungstenite::tungstenite::accept(stream).expect("upgrade");
+        let mut answered = 0;
+        while answered < 3 {
+            if let Message::Text(text) = ws.read().expect("read an opening request") {
+                let req: Value = serde_json::from_str(&text).expect("json request");
+                let id = req["id"].as_u64().expect("request id");
+                let result = match id {
+                    0 => "0x0",
+                    1 => "0x3b9aca00",
+                    _ => "MockNode/0.1",
+                };
+                ws.send(Message::Text(
+                    json!({"id": id, "result": result}).to_string(),
+                ))
+                .expect("send reply");
+                answered += 1;
+            }
+        }
+        let _ = ws.read().expect("read the subscribe request");
+        ws
+    }
+
+    /// A server that answers the opening exchange, stays quiet for `quiet`
+    /// before closing, then drains until the client is gone.
     fn healthy_server(quiet: Duration) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("read local addr");
         let thread = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept");
-            let mut ws = tokio_tungstenite::tungstenite::accept(stream).expect("upgrade");
-            let mut answered = 0;
-            while answered < 3 {
-                if let Message::Text(text) = ws.read().expect("read an opening request") {
-                    let req: Value = serde_json::from_str(&text).expect("json request");
-                    let id = req["id"].as_u64().expect("request id");
-                    let result = match id {
-                        0 => "0x0",
-                        1 => "0x3b9aca00",
-                        _ => "MockNode/0.1",
-                    };
-                    ws.send(Message::Text(
-                        json!({"id": id, "result": result}).to_string(),
-                    ))
-                    .expect("send reply");
-                    answered += 1;
-                }
-            }
-            let _ = ws.read().expect("read the subscribe request");
+            let mut ws = accept_subscriber(listener);
             std::thread::sleep(quiet);
             let _ = ws.close(None);
             while ws.read().is_ok() {}
@@ -835,10 +856,16 @@ mod tests {
         // the outer timeout is what turns a regression into a red test.
         let server = HeldListener::start();
         let (tx, mut rx) = mpsc::channel(8);
+        let mut streamed = false;
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_subscription_with(&server.url(), &tx, Duration::from_millis(250)),
+            run_subscription_with(
+                &server.url(),
+                &tx,
+                Duration::from_millis(250),
+                &mut streamed,
+            ),
         )
         .await
         .expect("the connect must fail by its own deadline, not hang");
@@ -854,22 +881,29 @@ mod tests {
             "should name the endpoint: {text}"
         );
         // The caller turns the error into `Disconnected`; the function itself
-        // sends nothing before the stream is up.
+        // sends nothing before the stream is up, and the backoff keeps growing.
         assert!(rx.try_recv().is_err());
+        assert!(!streamed);
 
         // A later connect to an endpoint that does answer still works.
         let (addr, thread) = healthy_server(Duration::from_millis(50));
         let later = tokio::time::timeout(
             Duration::from_secs(5),
-            run_subscription_with(&format!("ws://{addr}"), &tx, Duration::from_millis(250)),
+            run_subscription_with(
+                &format!("ws://{addr}"),
+                &tx,
+                Duration::from_millis(250),
+                &mut streamed,
+            ),
         )
         .await
         .expect("a healthy endpoint must not hang either");
         let _ = thread.join();
         assert!(
-            matches!(later, Ok(true)),
-            "the later connect should stream: {later:?}"
+            later.is_ok(),
+            "the later connect should end cleanly: {later:?}"
         );
+        assert!(streamed, "the later connect should have streamed");
     }
 
     #[tokio::test]
@@ -879,20 +913,90 @@ mod tests {
         // deadline must stop counting once the upgrade is done.
         let (addr, thread) = healthy_server(Duration::from_millis(600));
         let (tx, mut rx) = mpsc::channel(8);
+        let mut streamed = false;
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_subscription_with(&format!("ws://{addr}"), &tx, Duration::from_millis(250)),
+            run_subscription_with(
+                &format!("ws://{addr}"),
+                &tx,
+                Duration::from_millis(250),
+                &mut streamed,
+            ),
         )
         .await
         .expect("a server that closes after the upgrade must not hang the client");
         let _ = thread.join();
 
-        assert!(
-            matches!(outcome, Ok(true)),
-            "the connection should have streamed: {outcome:?}"
-        );
+        assert!(outcome.is_ok(), "the server closed cleanly: {outcome:?}");
+        assert!(streamed, "the connection should have streamed");
         assert!(matches!(rx.try_recv(), Ok(RpcEvent::Data(_))));
         assert!(matches!(rx.try_recv(), Ok(RpcEvent::Connected)));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_streamed_counts_as_streamed_however_it_ends() {
+        // The node streams a head, the client asks for the block, and then the
+        // socket drops with no Close frame, as it does when a node restarts or
+        // a flow dies. That ends in an error, and the session still streamed:
+        // the caller must see both to start its backoff over.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("read local addr");
+        let thread = std::thread::spawn(move || {
+            let mut ws = accept_subscriber(listener);
+            let head = json!({
+                "jsonrpc": "2.0",
+                "method": "eth_subscription",
+                "params": {"subscription": "0x1", "result": {"number": "0x1", "hash": "0xab"}},
+            });
+            ws.send(Message::Text(head.to_string())).expect("send head");
+            // Waiting for the block request proves the head was taken in
+            // before the socket goes away.
+            let _ = ws.read().expect("read the block request");
+            drop(ws);
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut streamed = false;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_subscription_with(
+                &format!("ws://{addr}"),
+                &tx,
+                Duration::from_millis(250),
+                &mut streamed,
+            ),
+        )
+        .await
+        .expect("a dropped socket must end the session, not hang it");
+        let _ = thread.join();
+
+        assert!(
+            outcome.is_err(),
+            "a drop without Close is an error: {outcome:?}"
+        );
+        assert!(streamed, "the session reached the stream before it dropped");
+        let mut connected = false;
+        while let Ok(event) = rx.try_recv() {
+            connected |= matches!(event, RpcEvent::Connected);
+        }
+        assert!(connected, "Connected was sent before the drop");
+    }
+
+    #[test]
+    fn the_backoff_doubles_to_its_cap_and_a_streamed_session_starts_it_over() {
+        let mut backoff = RECONNECT_MIN;
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            let (wait, next) = reconnect_delays(backoff, false);
+            waits.push(wait.as_secs());
+            backoff = next;
+        }
+        assert_eq!(waits, vec![1, 2, 4, 8, 16, 30, 30]);
+
+        // Pinned at the cap, then one session that streamed: back to the start.
+        let (wait, next) = reconnect_delays(backoff, true);
+        assert_eq!(wait, RECONNECT_MIN);
+        assert_eq!(next, RECONNECT_MIN * 2);
     }
 }
