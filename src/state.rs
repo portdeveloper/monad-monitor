@@ -179,6 +179,25 @@ impl AppState {
                 .map(|s| sample.timestamp_ms > s.timestamp_ms)
                 .unwrap_or(true)
             {
+                // A cumulative counter only climbs. A reading below the one before it means
+                // the source started over, not that transactions were undone, so nothing on
+                // the far side of that restart can be subtracted from this reading: the
+                // window is cleared and this sample becomes its first entry.
+                //
+                // Dropping the reading instead would leave the pre-restart samples in place
+                // and hold the rate at zero until they aged out, which is the bug. Zeroing
+                // the rate here would be the same mistake from the other side — a single
+                // point is not a measurement. The next sample is the first one with a
+                // baseline to be measured against, and the rate resumes there.
+                if self
+                    .tx_samples
+                    .back()
+                    .map(|s| sample.tx_commits < s.tx_commits)
+                    .unwrap_or(false)
+                {
+                    self.tx_samples.clear();
+                }
+
                 self.tx_samples.push_back(sample);
                 if self.tx_samples.len() > SAMPLE_HISTORY_SIZE {
                     self.tx_samples.pop_front();
@@ -508,6 +527,173 @@ mod tests {
         state.update_metrics(metrics_at(600, 60_000));
         state.update_metrics(metrics_at(1_100, 61_000));
         assert!((state.tps - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_restarted_counter_starts_a_fresh_window() {
+        // The sequence from the bug report. A node restart resets the cumulative counter
+        // while its clock keeps running, so the pre-restart samples cannot be subtracted
+        // from the ones after it.
+        let mut state = AppState::new();
+
+        state.update_metrics(metrics_at(1_000, 1_000));
+        assert_eq!(state.tps, 0.0, "one sample is not a rate");
+
+        state.update_metrics(metrics_at(1_010, 2_000));
+        assert!(
+            (state.tps - 10.0).abs() < 1e-9,
+            "before the restart: {}",
+            state.tps
+        );
+
+        // The restart itself. The reading is kept as the new baseline, and the rate stays
+        // where it was rather than being invented from a single point.
+        state.update_metrics(metrics_at(1, 3_000));
+        assert!(
+            (state.tps - 10.0).abs() < 1e-9,
+            "at the restart: {}",
+            state.tps
+        );
+
+        // Ten transactions in the second after the restart.
+        state.update_metrics(metrics_at(11, 4_000));
+        assert!(
+            (state.tps - 10.0).abs() < 1e-9,
+            "after the restart: {}",
+            state.tps
+        );
+
+        // One more poll, deliberately at a different rate. The reported sequence runs at ten
+        // either side of the restart, so a window that was merely left empty would hold the
+        // old reading and pass for the right answer. Thirty transactions in this second put
+        // the two-second window at twenty, which the rate before the restart cannot be
+        // mistaken for.
+        state.update_metrics(metrics_at(41, 5_000));
+        assert!(
+            (state.tps - 20.0).abs() < 1e-9,
+            "the window after the restart is measured, not held: {}",
+            state.tps
+        );
+    }
+
+    #[test]
+    fn a_counter_that_restarts_at_zero_is_no_different() {
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(1_000, 1_000));
+        state.update_metrics(metrics_at(1_010, 2_000));
+
+        state.update_metrics(metrics_at(0, 3_000));
+        state.update_metrics(metrics_at(10, 4_000));
+        assert!(
+            (state.tps - 10.0).abs() < 1e-9,
+            "after a restart at zero: {}",
+            state.tps
+        );
+    }
+
+    #[test]
+    fn a_restart_does_not_spike_the_rate_or_the_peak() {
+        // The other way to get this wrong: measure the post-restart reading against the
+        // pre-restart baseline and report the whole counter as one second's work.
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(1_000_000, 1_000));
+        state.update_metrics(metrics_at(1_000_010, 2_000));
+        let before = state.tps_peak;
+
+        state.update_metrics(metrics_at(5, 3_000));
+        state.update_metrics(metrics_at(15, 4_000));
+
+        assert!(
+            (state.tps - 10.0).abs() < 1e-9,
+            "rate after the restart: {}",
+            state.tps
+        );
+        assert_eq!(state.tps_peak, before, "the restart moved the peak");
+        assert!(
+            state.tps_sparkline_data().iter().all(|&p| p <= 10),
+            "a spike reached the sparkline: {:?}",
+            state.tps_sparkline_data()
+        );
+    }
+
+    #[test]
+    fn a_reading_the_clock_rejects_leaves_the_window_alone() {
+        // A lower counter only means a restart when the sample is one the window would
+        // otherwise accept. A stale frame that arrives with an old timestamp is rejected
+        // first, exactly as before, and must not clear anything on its way out.
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(1_000, 1_000));
+        state.update_metrics(metrics_at(1_010, 2_000));
+
+        state.update_metrics(metrics_at(5, 1_500));
+
+        state.update_metrics(metrics_at(1_030, 3_000));
+        assert!(
+            (state.tps - 15.0).abs() < 1e-9,
+            "the window was not the one that survived: {}",
+            state.tps
+        );
+    }
+
+    #[test]
+    fn a_counter_that_stands_still_keeps_its_window() {
+        // Equal is not a restart. An idle node reports the same total against a moving
+        // clock, and that reading belongs in the window: it is how a quiet minute shows up
+        // as a falling rate instead of a frozen one.
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(1_000, 1_000));
+        state.update_metrics(metrics_at(1_010, 2_000));
+        assert!((state.tps - 10.0).abs() < 1e-9);
+
+        state.update_metrics(metrics_at(1_010, 3_000));
+        assert!(
+            (state.tps - 5.0).abs() < 1e-9,
+            "ten transactions over two seconds: {}",
+            state.tps
+        );
+    }
+
+    #[test]
+    fn a_restart_above_the_oldest_sample_is_still_a_restart() {
+        // The comparison is against the newest sample, not the oldest one. A node that
+        // comes back and climbs past the front of the window is still a node that started
+        // over, and measuring the difference from the front invents transactions.
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(1_000, 1_000));
+        state.update_metrics(metrics_at(2_000, 2_000));
+        let before = state.tps;
+        assert!((before - 1_000.0).abs() < 1e-9);
+
+        state.update_metrics(metrics_at(1_500, 3_000));
+        assert!(
+            (state.tps - before).abs() < 1e-9,
+            "the restart was measured instead of being recognised: {}",
+            state.tps
+        );
+
+        state.update_metrics(metrics_at(1_600, 4_000));
+        assert!(
+            (state.tps - 100.0).abs() < 1e-9,
+            "a hundred transactions in the second after the restart: {}",
+            state.tps
+        );
+    }
+
+    #[test]
+    fn the_rate_still_decays_after_a_restart() {
+        // The fresh window is a window like any other: when the counter stops moving
+        // inside it, the rate comes down the same way.
+        let mut state = AppState::new();
+        state.update_metrics(metrics_at(1_000, 1_000));
+        state.update_metrics(metrics_at(1_010, 2_000));
+        state.update_metrics(metrics_at(1, 3_000));
+        state.update_metrics(metrics_at(11, 4_000));
+        assert!(state.tps > 0.0);
+
+        for _ in 0..SAMPLE_HISTORY_SIZE {
+            state.update_metrics(metrics_at(11, 4_000));
+        }
+        assert_eq!(state.tps, 0.0);
     }
 
     #[test]
