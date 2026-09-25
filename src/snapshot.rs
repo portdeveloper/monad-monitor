@@ -45,7 +45,9 @@ pub struct Snapshot {
     /// "no difference" apart from "no comparison".
     pub block_difference: Option<i64>,
     pub all_services_running: bool,
-    pub gas_price_gwei: f64,
+    /// `null` when the node never produced a readable gas price, so a script
+    /// can tell a healthy zero from no reading.
+    pub gas_price_gwei: Option<f64>,
     pub client_version: String,
     #[serde(flatten)]
     pub metrics: PrometheusMetrics,
@@ -172,7 +174,7 @@ mod tests {
     fn block_height_is_top_level_and_prefers_rpc() {
         let mut state = AppState::new();
         let rpc = RpcData {
-            block_number: 12345,
+            block_number: Some(12345),
             ..Default::default()
         };
         state.update_rpc(rpc);
@@ -183,6 +185,55 @@ mod tests {
         assert_eq!(v["block_height"], 12345);
         assert_eq!(v["network"], "testnet");
         assert_eq!(v["node_reachable"], true);
+    }
+
+    #[test]
+    fn an_unread_height_serializes_as_null_rather_than_zero() {
+        // Neither source has read a height: a fresh state whose RPC reply
+        // never parsed a block quantity. A script must see null here, not a
+        // node sitting at genesis.
+        let mut state = AppState::new();
+        state.update_rpc(RpcData::default());
+
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert!(
+            v["block_height"].is_null(),
+            "an unread height reached the snapshot as {}",
+            v["block_height"]
+        );
+        assert!(
+            v["block_difference"].is_null(),
+            "a difference was computed against a height nobody read"
+        );
+    }
+
+    #[test]
+    fn a_real_zero_height_reaches_the_snapshot_as_zero() {
+        // The other side of the same contract: a node at genesis reports
+        // zero, and that is a reading. Both branches keep it -- the
+        // subscription leading, and the metrics poll after it drops.
+        let mut state = AppState::new();
+        state.update_rpc(RpcData {
+            block_number: Some(0),
+            ..Default::default()
+        });
+        state.update_metrics(PrometheusMetrics {
+            block_num: None,
+            ..Default::default()
+        });
+
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(
+            v["block_height"], 0,
+            "a measured zero-height reading was reported as no reading"
+        );
+
+        state.set_ws_disconnected("gone".to_string());
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(
+            v["block_height"], 0,
+            "the disconnected branch lost the measured zero"
+        );
     }
 
     #[test]
@@ -307,11 +358,58 @@ mod tests {
             ..Default::default()
         });
         state.update_rpc(RpcData {
-            block_number: 100,
+            block_number: Some(100),
             ..Default::default()
         });
         let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
         assert_eq!(v["block_difference"], 20);
+    }
+
+    #[test]
+    fn an_unread_gas_price_reaches_the_snapshot_as_null_not_zero() {
+        // The handshake quantity never parsed, so RpcData stays at its
+        // default. A script must be able to tell "no reading" from a real
+        // zero gas price.
+        let mut state = AppState::new();
+        state.update_rpc(RpcData::default());
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert!(
+            v["gas_price_gwei"].is_null(),
+            "unread gas price must serialize as null, got {}",
+            v["gas_price_gwei"]
+        );
+    }
+
+    #[test]
+    fn a_real_zero_gas_price_still_reaches_the_snapshot_as_zero() {
+        // The other side: `Some(0.0)` is a measured zero and must not be
+        // collapsed into the unknown case.
+        let mut state = AppState::new();
+        state.update_rpc(RpcData {
+            block_number: Some(50),
+            gas_price_gwei: Some(0.0),
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(v["gas_price_gwei"].as_f64(), Some(0.0));
+        assert_eq!(v["block_height"], 50);
+    }
+
+    #[test]
+    fn a_bad_live_gas_reply_keeps_the_last_reading_the_operator_sees() {
+        // Previously measured value first, then a malformed live reply: the
+        // snapshot still carries the measurement, not zero and not null.
+        use crate::rpc::apply_gas_price;
+        use serde_json::json;
+
+        let mut data = RpcData::default();
+        assert!(apply_gas_price(&mut data, Some(&json!("0x77359400"))));
+        assert!(!apply_gas_price(&mut data, Some(&json!("0xzz"))));
+
+        let mut state = AppState::new();
+        state.update_rpc(data);
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(v["gas_price_gwei"], 2.0);
     }
 
     #[test]

@@ -223,7 +223,7 @@ impl AppState {
             }
         }
 
-        if rpc_data.block_number > 0 {
+        if rpc_data.block_number.is_some() {
             self.last_rpc_block_at = Some(Instant::now());
         }
         self.ws_connected = true;
@@ -325,24 +325,27 @@ impl AppState {
 
     /// The height to show, or `None` when neither source has reported one.
     ///
-    /// Inventing a zero here would undo the point of the metric being optional:
-    /// zero is a real height a node at genesis reports, and the snapshot would
-    /// say `block_num: null` next to `block_height: 0`.
+    /// Inventing a zero here would undo the point of both fields being
+    /// optional: zero is a real height a node at genesis reports, and the
+    /// snapshot would say `block_num: null` next to `block_height: 0`.
     pub fn block_height(&self) -> Option<u64> {
-        // 0 is this field's own "not reported" marker on the RPC side.
-        let rpc = (self.rpc_data.block_number > 0).then_some(self.rpc_data.block_number);
+        let rpc = self.rpc_data.block_number;
 
         // The WebSocket's height leads while the subscription is up. Once it
         // drops, that number only ages, and the metrics poll is still
         // reporting; taking the higher of the two keeps the header moving
-        // instead of frozen at the moment the stream died.
+        // instead of frozen at the moment the stream died. A height nobody
+        // has read contributes nothing rather than a zero that would pin the
+        // header to the floor.
         if !self.ws_connected {
             return match (rpc, self.metrics.block_num) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (found, None) | (None, found) => found,
             };
         }
-        // Prefer RPC block number as it's more accurate
+        // Prefer RPC block number as it's more accurate. A real zero-height
+        // reading (`Some(0)`) is kept as such; only an unread height falls
+        // back to the metrics poll.
         rpc.or(self.metrics.block_num)
     }
 
@@ -811,7 +814,7 @@ mod tests {
     fn the_height_follows_metrics_once_the_websocket_drops() {
         let mut state = AppState::new();
         state.update_rpc(RpcData {
-            block_number: 90,
+            block_number: Some(90),
             ..Default::default()
         });
         state.update_metrics(PrometheusMetrics {
@@ -826,5 +829,27 @@ mod tests {
 
         state.set_ws_connected();
         assert_eq!(state.block_height(), Some(90));
+    }
+
+    #[test]
+    fn an_unread_rpc_height_is_unknown_to_the_header_not_a_stuck_zero() {
+        // The handshake quantity never parsed, so RpcData stays default.
+        // The header must fall back to the metrics poll rather than pin at
+        // the struct default of zero while the subscription is "up".
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(100),
+            ..Default::default()
+        });
+        state.update_rpc(RpcData::default());
+        state.set_ws_connected();
+        assert_eq!(state.block_height(), Some(100));
+
+        // A real zero-height reading is a measurement and survives as zero.
+        state.update_rpc(RpcData {
+            block_number: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(state.block_height(), Some(0));
     }
 }

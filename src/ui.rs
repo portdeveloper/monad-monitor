@@ -735,8 +735,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState, label_color: Col
     // Service uptime (time since restart)
     let service_uptime = state.system.uptime_since_restart();
 
-    // Gas price
-    let gas_gwei = state.rpc_data.gas_price_gwei;
+    // Gas price. Unknown until the node produces a readable quantity, so an
+    // unread field reads as "..." rather than a measured zero.
+    let gas_gwei = match state.rpc_data.gas_price_gwei {
+        Some(gwei) => format!("{:.0}gwei", gwei),
+        None => "...".to_string(),
+    };
 
     // Client version (shortened)
     let version = if state.rpc_data.client_version.is_empty() {
@@ -766,7 +770,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState, label_color: Col
         Span::styled(service_uptime, Style::default().fg(value_color)),
         Span::raw("  |  "),
         Span::styled("GAS: ", Style::default().fg(label_color)),
-        Span::styled(format!("{:.0}gwei", gas_gwei), Style::default().fg(value_color)),
+        Span::styled(gas_gwei, Style::default().fg(value_color)),
         Span::raw("  |  "),
         Span::styled(version, Style::default().fg(label_color)),
         Span::raw("  |  "),
