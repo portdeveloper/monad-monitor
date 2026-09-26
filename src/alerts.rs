@@ -399,7 +399,7 @@ pub fn evaluate(
             AlertKind::DiskFull,
             pct > limit,
             format!("{:.1}%", pct),
-            format!("{:.0}%", limit),
+            format!("{}%", limit),
         );
     }
 
@@ -669,6 +669,53 @@ mod tests {
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].kind, AlertKind::LowPeers);
         assert!(state.is_tripped(AlertKind::DiskFull));
+    }
+
+    #[test]
+    fn a_disk_alert_states_the_threshold_that_was_configured() {
+        // `{:.0}` did not round the threshold for display, it named a different
+        // one: 85.5 was reported as 86%, and 86 does not fire at the 85.7%
+        // reading that produced the alert. Only the reported number was wrong;
+        // the comparison always used the raw f64.
+        for (limit, reading, threshold, value) in [
+            // Rounds up under {:.0}, onto a threshold that would not have fired.
+            (85.5, 85.7, "85.5%", "85.7%"),
+            // Rounds down under {:.0}, onto 0%, which was separately settable.
+            (0.5, 85.7, "0.5%", "85.7%"),
+            // Two decimals: {:.1} is not enough either, and would say 100%.
+            (99.95, 99.97, "99.95%", "100.0%"),
+            // An integer threshold must keep reading as one, not "85.0%".
+            (85.0, 85.7, "85%", "85.7%"),
+        ] {
+            let config = AlertConfig {
+                disk_pct: Some(limit),
+                confirm_samples: 1,
+                cooldown_secs: 0,
+                ..AlertConfig::default()
+            };
+            let sample = Sample {
+                disk_pct: Some(reading),
+                ..Sample::default()
+            };
+            let fired = evaluate(&mut AlertState::default(), &config, &sample, 0);
+
+            assert_eq!(fired.len(), 1, "{} did not fire at {}%", limit, reading);
+            assert_eq!(
+                fired[0].threshold, threshold,
+                "--alert-disk {} reported {:?}",
+                limit, fired[0].threshold
+            );
+            // The reading keeps its own precision; only the threshold changed.
+            assert_eq!(fired[0].value, value);
+            // One string reaches the sentence and the JSON field, so pin both.
+            let payload = fired[0].payload("MFNode");
+            assert_eq!(payload["threshold"], threshold);
+            assert!(
+                payload["content"].as_str().unwrap().contains(threshold),
+                "message was {:?}",
+                payload["content"]
+            );
+        }
     }
 
     #[test]
