@@ -47,6 +47,30 @@ Or point it at a node on another host or on other ports:
 monad-monitor --metrics-url http://node:8889/metrics --ws-url ws://node:8081
 ```
 
+### Headless JSON
+
+One snapshot, as a single JSON object, for a shell or cron check:
+
+```bash
+monad-monitor --json
+```
+
+The exit status is non-zero when the node is unreachable, so a check can alert on it.
+
+A stream of snapshots, one JSON object per line (NDJSON), every five seconds until interrupted:
+
+```bash
+monad-monitor --json --watch 5
+```
+
+A bounded capture, for attaching a fixed number of samples to a diagnostic without a shell timeout or a `head` pipeline:
+
+```bash
+monad-monitor --json --watch 5 --count 3
+```
+
+That emits exactly three complete lines and exits. The first reading primes the TPS rate and is not one of the three. `--count` takes a positive integer and only applies alongside `--json --watch`; a completed capture exits 0 when the last sample reached the node and 1 when it did not, the same rule as the one-shot form.
+
 ### Endpoint options
 
 Every default is the value the monitor used to hardcode, so a run with no flags
