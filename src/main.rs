@@ -245,6 +245,7 @@ async fn run_app<B: Backend>(
     alert_config: AlertConfig,
 ) -> Result<()> {
     let mut state = AppState::new();
+    state.network = cfg.network.clone();
 
     // One client for every webhook POST, and only when a webhook is configured.
     let webhook_client = alert_config
