@@ -31,6 +31,7 @@ pub struct AppState {
     pub metrics: PrometheusMetrics,
     pub rpc_data: RpcData,
     pub system: SystemData,
+    pub network: String,
 
     // TPS calculation
     tx_samples: VecDeque<TxSample>,
@@ -108,6 +109,7 @@ impl AppState {
             metrics: PrometheusMetrics::default(),
             rpc_data: RpcData::default(),
             system: SystemData::default(),
+            network: "mainnet".to_string(),
             tx_samples: VecDeque::with_capacity(SAMPLE_HISTORY_SIZE),
             tps: 0.0,
             tps_history: VecDeque::with_capacity(TPS_HISTORY_SIZE),
@@ -1255,5 +1257,11 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(state.block_height(), Some(0));
+    }
+
+    #[test]
+    fn default_network_is_mainnet() {
+        let state = AppState::new();
+        assert_eq!(state.network, "mainnet");
     }
 }
