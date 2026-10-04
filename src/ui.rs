@@ -198,7 +198,10 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
     let title = Line::from(vec![
         Span::styled(" monad-monitor ", Style::default().fg(title_color).bold()),
         Span::styled("●", Style::default().fg(pulse_color)),
-        Span::styled(" MAINNET ", Style::default().fg(Color::Green).bold()),
+        Span::styled(
+            format!(" {} ", state.network.to_uppercase()),
+            Style::default().fg(Color::Green).bold(),
+        ),
         Span::styled(format!("[{}] ", node_id_display), Style::default().fg(label_color)),
     ]);
 
@@ -818,6 +821,7 @@ fn format_age(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
     fn ages_under_a_minute_keep_the_seconds_form() {
@@ -859,5 +863,123 @@ mod tests {
                 rendered.len()
             );
         }
+    }
+
+    fn header_title_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn header_renders_default_network_mainnet() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let cfg = crate::config::Config::default();
+        let mut state = AppState::new();
+        state.network = cfg.network.clone();
+
+        terminal.draw(|f| draw(f, &state)).unwrap();
+
+        let rendered = header_title_text(&terminal);
+        assert!(
+            rendered.contains("MAINNET"),
+            "Expected header to contain MAINNET, got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn header_renders_cli_flag_network() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut flag_layer = crate::config::Layer::default();
+        flag_layer.apply_flag("--network", "testnet").unwrap();
+        let cfg = crate::config::Config::resolve(crate::config::Layer::default(), flag_layer);
+
+        let mut state = AppState::new();
+        state.network = cfg.network.clone();
+
+        terminal.draw(|f| draw(f, &state)).unwrap();
+
+        let rendered = header_title_text(&terminal);
+        assert!(
+            rendered.contains("TESTNET"),
+            "Expected header to contain TESTNET, got: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("MAINNET"),
+            "Header should not display MAINNET on testnet run"
+        );
+    }
+
+    #[test]
+    fn header_renders_config_file_network() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let file_layer =
+            crate::config::parse_file("network = \"testnet-2\"\n", "config.toml").unwrap();
+        let cfg = crate::config::Config::resolve(file_layer, crate::config::Layer::default());
+
+        let mut state = AppState::new();
+        state.network = cfg.network.clone();
+
+        terminal.draw(|f| draw(f, &state)).unwrap();
+
+        let rendered = header_title_text(&terminal);
+        assert!(
+            rendered.contains("TESTNET-2"),
+            "Expected header to contain TESTNET-2, got: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("MAINNET"),
+            "Header should not display MAINNET on testnet run"
+        );
+    }
+
+    #[test]
+    fn header_renders_network_when_external_rpc_url_overridden() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut flag_layer = crate::config::Layer::default();
+        flag_layer.apply_flag("--network", "testnet").unwrap();
+        flag_layer
+            .apply_flag("--external-rpc-url", "wss://rpc.example.com")
+            .unwrap();
+        let cfg = crate::config::Config::resolve(crate::config::Layer::default(), flag_layer);
+
+        let mut state = AppState::new();
+        state.network = cfg.network.clone();
+
+        terminal.draw(|f| draw(f, &state)).unwrap();
+
+        let rendered = header_title_text(&terminal);
+        assert!(
+            rendered.contains("TESTNET"),
+            "Expected header to contain TESTNET, got: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("MAINNET"),
+            "Header should not display MAINNET when network is testnet"
+        );
+    }
+
+    #[test]
+    fn header_renders_long_network_name_without_panic() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::new();
+        state.network = "a".repeat(63);
+
+        terminal.draw(|f| draw(f, &state)).unwrap();
     }
 }
