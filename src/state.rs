@@ -300,12 +300,17 @@ impl AppState {
         // System updates every 5 seconds
         const UPDATE_INTERVAL_SECS: f64 = 5.0;
 
-        if self.net_rx_prev > 0 && system.net_rx_bytes > self.net_rx_prev {
-            self.net_rx_rate = (system.net_rx_bytes - self.net_rx_prev) as f64 / UPDATE_INTERVAL_SECS;
-        }
-        if self.net_tx_prev > 0 && system.net_tx_bytes > self.net_tx_prev {
-            self.net_tx_rate = (system.net_tx_bytes - self.net_tx_prev) as f64 / UPDATE_INTERVAL_SECS;
-        }
+        // One lifetime reading is not a rate; zero is a valid baseline after it.
+        self.net_rx_rate = if self.system_seen {
+            system.net_rx_bytes.saturating_sub(self.net_rx_prev) as f64 / UPDATE_INTERVAL_SECS
+        } else {
+            0.0
+        };
+        self.net_tx_rate = if self.system_seen {
+            system.net_tx_bytes.saturating_sub(self.net_tx_prev) as f64 / UPDATE_INTERVAL_SECS
+        } else {
+            0.0
+        };
 
         self.net_rx_prev = system.net_rx_bytes;
         self.net_tx_prev = system.net_tx_bytes;
@@ -531,6 +536,129 @@ mod tests {
             tx_commits: Some(commits),
             tx_commits_timestamp_ms: ts_ms,
             ..Default::default()
+        }
+    }
+
+    fn network_at(rx: u64, tx: u64) -> SystemData {
+        SystemData {
+            net_rx_bytes: rx,
+            net_tx_bytes: tx,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn network_rate_uses_the_first_reading_as_a_baseline_including_zero() {
+        for (rx, tx) in [(1_000, 2_000), (0, 0), (0, 2_000), (1_000, 0)] {
+            let mut state = AppState::new();
+            state.update_system(network_at(rx, tx));
+            assert_eq!((state.net_rx_rate, state.net_tx_rate), (0.0, 0.0));
+
+            state.update_system(network_at(rx + 5, tx + 10));
+            assert_eq!((state.net_rx_rate, state.net_tx_rate), (1.0, 2.0));
+        }
+    }
+
+    #[test]
+    fn network_rate_clears_idle_readings_and_measures_the_next_interval() {
+        let mut state = AppState::new();
+        state.update_system(network_at(1_000, 2_000));
+        state.update_system(network_at(2_000, 4_000));
+        assert_eq!((state.net_rx_rate, state.net_tx_rate), (200.0, 400.0));
+
+        for _ in 0..3 {
+            state.update_system(network_at(2_000, 4_000));
+            assert_eq!((state.net_rx_rate, state.net_tx_rate), (0.0, 0.0));
+        }
+
+        state.update_system(network_at(2_250, 4_500));
+        assert_eq!((state.net_rx_rate, state.net_tx_rate), (50.0, 100.0));
+    }
+
+    #[test]
+    fn network_rate_rebases_after_a_reset_and_recovers_at_a_different_rate() {
+        for (rx, tx) in [(100, 200), (0, 0), (1_500, 3_500)] {
+            let mut state = AppState::new();
+            state.update_system(network_at(1_000, 2_000));
+            state.update_system(network_at(2_000, 4_000));
+            assert_eq!((state.net_rx_rate, state.net_tx_rate), (200.0, 400.0));
+
+            state.update_system(network_at(rx, tx));
+            assert_eq!((state.net_rx_rate, state.net_tx_rate), (0.0, 0.0));
+
+            state.update_system(network_at(rx + 250, tx + 375));
+            assert_eq!((state.net_rx_rate, state.net_tx_rate), (50.0, 75.0));
+        }
+    }
+
+    #[test]
+    fn network_rate_keeps_idle_and_reset_directions_independent() {
+        let mut state = AppState::new();
+        for (rx, tx, expected_rx, expected_tx) in [
+            (1_000, 2_000, 0.0, 0.0),
+            (2_000, 4_000, 200.0, 400.0),
+            (2_000, 4_500, 0.0, 100.0),
+            (2_500, 4_500, 100.0, 0.0),
+            (100, 5_000, 0.0, 100.0),
+            (350, 0, 50.0, 0.0),
+            (600, 375, 50.0, 75.0),
+            (0, 375, 0.0, 0.0),
+            (250, 875, 50.0, 100.0),
+        ] {
+            state.update_system(network_at(rx, tx));
+            assert_eq!(
+                (state.net_rx_rate, state.net_tx_rate),
+                (expected_rx, expected_tx),
+                "RX {rx}, TX {tx}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_rate_preserves_small_deltas_near_the_counter_limit() {
+        let mut state = AppState::new();
+        state.update_system(network_at(u64::MAX - 15, u64::MAX - 20));
+        assert_eq!((state.net_rx_rate, state.net_tx_rate), (0.0, 0.0));
+        state.update_system(network_at(u64::MAX - 10, u64::MAX - 10));
+        assert_eq!((state.net_rx_rate, state.net_tx_rate), (1.0, 2.0));
+
+        state.update_system(network_at(u64::MAX, u64::MAX));
+        assert_eq!((state.net_rx_rate, state.net_tx_rate), (2.0, 2.0));
+        state.update_system(network_at(0, 0));
+        assert_eq!((state.net_rx_rate, state.net_tx_rate), (0.0, 0.0));
+
+        state.update_system(network_at(u64::MAX, u64::MAX));
+        let expected = u64::MAX as f64 / 5.0;
+        assert!(expected.is_finite() && expected > 0.0);
+        assert_eq!((state.net_rx_rate, state.net_tx_rate), (expected, expected));
+    }
+
+    #[test]
+    fn network_rate_idle_reset_and_recovery_reach_the_net_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+        let mut state = AppState::new();
+        for (rx, tx, expected) in [
+            (1_000, 2_000, "NET: ↓0B/s ↑0B/s"),
+            (2_000, 4_000, "NET: ↓200B/s ↑400B/s"),
+            (2_000, 4_000, "NET: ↓0B/s ↑0B/s"),
+            (2_500, 5_000, "NET: ↓100B/s ↑200B/s"),
+            (100, 200, "NET: ↓0B/s ↑0B/s"),
+            (350, 575, "NET: ↓50B/s ↑75B/s"),
+        ] {
+            state.update_system(network_at(rx, tx));
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &state))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains(expected), "missing {expected}");
         }
     }
 
