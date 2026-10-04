@@ -121,10 +121,77 @@ async fn collect(
     metrics_ok || rpc_ok
 }
 
+/// Where a watch line's reading comes from.
+///
+/// Production reads the node. A test scripts the readings, which is the only way
+/// to assert "exactly n lines" from both ends: the count the writer received and
+/// the number of readings the loop asked for.
+trait Samples {
+    async fn next_sample(&mut self) -> (Snapshot, bool);
+}
+
+/// The node itself, carrying the state the TPS rate is computed from across
+/// readings.
+struct NodeSamples<'a> {
+    state: AppState,
+    metrics: &'a MetricsClient,
+    system: &'a mut SystemClient,
+    rpc: &'a RpcClient,
+    network: &'a str,
+}
+
+impl Samples for NodeSamples<'_> {
+    async fn next_sample(&mut self) -> (Snapshot, bool) {
+        let reachable = collect(&mut self.state, self.metrics, self.system, self.rpc).await;
+        (
+            Snapshot::from_state(&self.state, self.network, reachable),
+            reachable,
+        )
+    }
+}
+
+/// Emit NDJSON on every tick, stopping after `count` lines when one is given.
+///
+/// `count = None` keeps the behaviour this had before it was bounded: stream
+/// until the reader goes away. A closed pipe is still a quiet exit 0 in both
+/// cases — the operator who pressed `head -1` did not ask for a failure. A
+/// completed bounded capture reports the last reading's reachability instead,
+/// matching the one-shot convention, because there the exit status is the
+/// answer rather than an interruption.
+async fn emit<S: Samples, W: Write>(
+    samples: &mut S,
+    out: &mut W,
+    period: Duration,
+    count: Option<u64>,
+) -> Result<i32> {
+    // Prime one reading, which is not a sample: nothing is written for it, and a
+    // bounded capture of n still emits n lines. It exists so the first emitted
+    // line already carries a TPS rate, which a single reading cannot give. The
+    // rule lives here rather than at the call site so that one place owns it and
+    // a test can hold it to the count.
+    samples.next_sample().await;
+
+    let mut ticker = tokio::time::interval(period);
+    let mut emitted: u64 = 0;
+    loop {
+        ticker.tick().await;
+        let (snap, reachable) = samples.next_sample().await;
+        if writeln!(out, "{}", serde_json::to_string(&snap)?).is_err() {
+            return Ok(0);
+        }
+        let _ = out.flush();
+        emitted += 1;
+        if count.is_some_and(|n| emitted >= n) {
+            return Ok(if reachable { 0 } else { 1 });
+        }
+    }
+}
+
 /// Run the headless mode. With `watch = None` it prints one snapshot and
 /// returns an exit code (0 reachable, 1 unreachable). With `watch = Some(secs)`
-/// it prints one JSON object per interval as NDJSON and runs until interrupted.
-pub async fn run(cfg: &Config, watch: Option<u64>) -> Result<i32> {
+/// it prints one JSON object per interval as NDJSON: until interrupted, or until
+/// `count` lines have been emitted when a count is given.
+pub async fn run(cfg: &Config, watch: Option<u64>, count: Option<u64>) -> Result<i32> {
     let metrics = MetricsClient::new(&cfg.metrics_url);
     let mut system = SystemClient::new(&cfg.resolved_external_rpc_url());
     let rpc = RpcClient::new(&cfg.ws_url);
@@ -144,23 +211,15 @@ pub async fn run(cfg: &Config, watch: Option<u64>) -> Result<i32> {
         }
         Some(secs) => {
             let period = Duration::from_secs(secs.max(1));
-            // Prime one reading so the first emitted line already has a TPS.
-            collect(&mut state, &metrics, &mut system, &rpc).await;
-
-            let mut ticker = tokio::time::interval(period);
-            let stdout = std::io::stdout();
-            loop {
-                ticker.tick().await;
-                let reachable = collect(&mut state, &metrics, &mut system, &rpc).await;
-                let snap = Snapshot::from_state(&state, &cfg.network, reachable);
-                let line = serde_json::to_string(&snap)?;
-                let mut handle = stdout.lock();
-                // If stdout is gone (piped into a closed reader), stop quietly.
-                if writeln!(handle, "{}", line).is_err() {
-                    return Ok(0);
-                }
-                let _ = handle.flush();
-            }
+            let mut samples = NodeSamples {
+                state,
+                metrics: &metrics,
+                system: &mut system,
+                rpc: &rpc,
+                network: &cfg.network,
+            };
+            let mut out = std::io::stdout().lock();
+            emit(&mut samples, &mut out, period, count).await
         }
     }
 }
@@ -169,6 +228,152 @@ pub async fn run(cfg: &Config, watch: Option<u64>) -> Result<i32> {
 mod tests {
     use super::*;
     use crate::rpc::RpcData;
+
+    /// A scripted sample source. Counts what the loop asked for, so "exactly n
+    /// lines" is checked from both ends rather than only at the writer.
+    struct ScriptedSamples {
+        asked: usize,
+        reachable: Vec<bool>,
+    }
+
+    impl ScriptedSamples {
+        fn always(reachable: bool) -> Self {
+            Self {
+                asked: 0,
+                reachable: vec![reachable; 64],
+            }
+        }
+    }
+
+    impl Samples for ScriptedSamples {
+        async fn next_sample(&mut self) -> (Snapshot, bool) {
+            let reachable = *self.reachable.get(self.asked).unwrap_or(&true);
+            self.asked += 1;
+            let state = AppState::new();
+            (
+                Snapshot::from_state(&state, "testnet", reachable),
+                reachable,
+            )
+        }
+    }
+
+    /// A writer that fails on its first call, standing in for a pipe whose reader
+    /// has gone away.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const FAST: Duration = Duration::from_millis(1);
+
+    /// Run `emit` under a deadline.
+    ///
+    /// A bounded capture that never reaches its count does not fail a plain test —
+    /// it hangs, and a hanging test spends the whole CI budget instead of saying
+    /// what broke. A mutation that drops the counter's increment found this: the
+    /// suite stopped responding rather than going red. The deadline turns that
+    /// into a named failure.
+    async fn emit_bounded<S: Samples, W: Write>(
+        samples: &mut S,
+        out: &mut W,
+        count: Option<u64>,
+    ) -> Result<i32> {
+        match timeout(Duration::from_secs(5), emit(samples, out, FAST, count)).await {
+            Ok(r) => r,
+            Err(_) => panic!("emit did not finish within 5s for count {:?}", count),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bounded_capture_emits_exactly_the_count_it_was_given() {
+        for want in [1usize, 2, 3, 7] {
+            let mut samples = ScriptedSamples::always(true);
+            let mut out: Vec<u8> = Vec::new();
+            let code = emit_bounded(&mut samples, &mut out, Some(want as u64))
+                .await
+                .unwrap();
+
+            let lines: Vec<&str> = std::str::from_utf8(&out)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert_eq!(
+                lines.len(),
+                want,
+                "count {} emitted {} lines",
+                want,
+                lines.len()
+            );
+            // One more reading than lines: the priming read is taken and not written.
+            assert_eq!(
+                samples.asked,
+                want + 1,
+                "count {} asked for {} readings, expected {} plus the priming one",
+                want,
+                samples.asked,
+                want
+            );
+            assert_eq!(code, 0);
+            // Every line is a whole snapshot, not a fragment of one.
+            for l in lines {
+                serde_json::from_str::<serde_json::Value>(l).expect("line was not a JSON object");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_completed_capture_reports_the_last_reading_like_the_one_shot_does() {
+        // Unreachable on the final reading only: the status answers "what did the
+        // last sample see", not "was anything ever reachable".
+        let mut samples = ScriptedSamples {
+            asked: 0,
+            // The first entry is consumed by the priming read; the three after it are
+            // the emitted samples.
+            reachable: vec![true, true, true, false],
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_bounded(&mut samples, &mut out, Some(3)).await.unwrap();
+        assert_eq!(code, 1, "a capture ending on an unreachable node exited 0");
+
+        let mut samples = ScriptedSamples {
+            asked: 0,
+            reachable: vec![false, false, false, true],
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_bounded(&mut samples, &mut out, Some(3)).await.unwrap();
+        assert_eq!(
+            code, 0,
+            "a capture ending on a reachable node did not exit 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_pipe_still_exits_quietly_bounded_or_not() {
+        // The operator who piped into `head -1` did not ask for a failure, and that
+        // was true before --count existed. It stays true on both paths.
+        for count in [None, Some(5)] {
+            let mut samples = ScriptedSamples::always(true);
+            let code = emit_bounded(&mut samples, &mut ClosedPipe, count)
+                .await
+                .unwrap();
+            assert_eq!(
+                code, 0,
+                "count {:?} turned a closed pipe into a failure",
+                count
+            );
+            assert_eq!(
+                samples.asked, 2,
+                "the loop kept reading after the pipe closed (one priming read, one written)"
+            );
+        }
+    }
 
     #[test]
     fn block_height_is_top_level_and_prefers_rpc() {

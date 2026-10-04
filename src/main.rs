@@ -53,6 +53,9 @@ enum Cli {
     /// NDJSON, or `None` for a single snapshot.
     Json {
         watch: Option<u64>,
+        /// How many NDJSON lines to emit before exiting normally, or `None` to
+        /// stream until interrupted. Only meaningful alongside `watch`.
+        count: Option<u64>,
         endpoints: config::Layer,
     },
     /// Print usage and exit.
@@ -64,6 +67,7 @@ enum Cli {
 fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
     let mut json = false;
     let mut watch: Option<u64> = None;
+    let mut count: Option<u64> = None;
     let mut alerts = AlertConfig::default();
     let mut endpoints = config::Layer::default();
 
@@ -78,6 +82,20 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
                     _ => {
                         return Err(
                             "--watch requires a positive integer number of seconds".to_string()
+                        )
+                    }
+                }
+            }
+            "--count" => {
+                i += 1;
+                // One parse covers every rejection the flag needs: a missing value,
+                // a word, a negative, a fraction and a number past u64 all fail it,
+                // and zero fails the bound. Same shape as --watch above, deliberately.
+                match args.get(i).and_then(|s| s.parse::<u64>().ok()) {
+                    Some(n) if n > 0 => count = Some(n),
+                    _ => {
+                        return Err(
+                            "--count requires a positive integer number of samples".to_string()
                         )
                     }
                 }
@@ -107,6 +125,15 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
         return Err("--watch only applies to --json mode".to_string());
     }
 
+    // A bounded capture is a bounded stream, so it needs the stream. Without
+    // --watch there is one snapshot and nothing to count; saying so beats
+    // accepting the flag and ignoring it, which is how --refresh is handled below.
+    if count.is_some() && watch.is_none() {
+        return Err(
+            "--count applies to --json --watch <secs>, which sets the interval".to_string(),
+        );
+    }
+
     // The snapshot prints one reading and exits, so it has no state in which to
     // raise or clear an alert. Saying so beats accepting the flag and ignoring
     // it.
@@ -124,7 +151,11 @@ fn parse_args(args: &[String]) -> std::result::Result<Cli, String> {
     }
 
     if json {
-        Ok(Cli::Json { watch, endpoints })
+        Ok(Cli::Json {
+            watch,
+            count,
+            endpoints,
+        })
     } else {
         Ok(Cli::Tui { alerts, endpoints })
     }
@@ -137,6 +168,8 @@ fn print_help() {
     println!("    monad-monitor                        Run the interactive TUI (default)");
     println!("    monad-monitor --json                 Print one JSON snapshot and exit");
     println!("    monad-monitor --json --watch <secs>  Print a JSON object every <secs> (NDJSON)");
+    println!("    monad-monitor --json --watch 5 --count 3");
+    println!("                                         Capture exactly 3 NDJSON samples and exit");
     println!("    monad-monitor --help                 Show this help");
     println!("    monad-monitor --version              Print the version and exit");
     println!();
@@ -165,6 +198,10 @@ fn print_help() {
     println!("    metrics_url, ws_url, refresh, network, external_rpc_url. A flag beats");
     println!("    the file, and the file beats the default.");
     println!();
+    println!("BOUNDED CAPTURE (--json --watch only):");
+    println!("    --count <n>                  Emit exactly n NDJSON samples, then exit");
+    println!("                                 normally. The priming read is not a sample.");
+    println!();
     println!("The headless snapshot reuses the same data path as the TUI (metrics, RPC and");
     println!("system stats). In one-shot mode the exit status is non-zero when the node is");
     println!("unreachable, so a shell or cron check can alert on it.");
@@ -191,8 +228,12 @@ async fn main() -> Result<()> {
             println!("monad-monitor {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Cli::Json { watch, endpoints } => {
-            let code = snapshot::run(&settings(endpoints), watch).await?;
+        Cli::Json {
+            watch,
+            count,
+            endpoints,
+        } => {
+            let code = snapshot::run(&settings(endpoints), watch, count).await?;
             std::process::exit(code);
         }
         Cli::Tui { alerts, endpoints } => run_tui(settings(endpoints), alerts).await,
@@ -447,6 +488,60 @@ mod tests {
     }
 
     #[test]
+    fn json_watch_with_count_bounds_the_capture() {
+        assert_eq!(
+            parse_args(&args(&["--json", "--watch", "5", "--count", "3"])).unwrap(),
+            Cli::Json {
+                watch: Some(5),
+                count: Some(3),
+                endpoints: config::Layer::default(),
+            }
+        );
+        // One is a capture like any other, and the boundary most likely to be
+        // special-cased by accident.
+        assert_eq!(
+            parse_args(&args(&["--json", "--watch", "1", "--count", "1"])).unwrap(),
+            Cli::Json {
+                watch: Some(1),
+                count: Some(1),
+                endpoints: config::Layer::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_count_that_is_not_a_number_of_samples_is_refused() {
+        // Every shape that is not a positive integer, refused before collection
+        // starts rather than rounded, truncated or taken as "stream forever".
+        for bad in [
+            "0",
+            "abc",
+            "-1",
+            "1.5",
+            "1e3",
+            " 3",
+            // past u64: parsed, not clamped
+            "18446744073709551616",
+        ] {
+            assert!(
+                parse_args(&args(&["--json", "--watch", "5", "--count", bad])).is_err(),
+                "--count {} was accepted",
+                bad
+            );
+        }
+        // The value is missing entirely.
+        assert!(parse_args(&args(&["--json", "--watch", "5", "--count"])).is_err());
+    }
+
+    #[test]
+    fn a_count_without_a_watch_interval_is_refused() {
+        // There is nothing to count in a single snapshot, and nothing to count at
+        // all without --json.
+        assert!(parse_args(&args(&["--json", "--count", "3"])).is_err());
+        assert!(parse_args(&args(&["--count", "3"])).is_err());
+    }
+
+    #[test]
     fn alert_flags_are_rejected_in_json_mode() {
         assert!(parse_args(&args(&["--json", "--alert-min-peers", "10"])).is_err());
     }
@@ -457,6 +552,7 @@ mod tests {
             parse_args(&args(&["--json"])).unwrap(),
             Cli::Json {
                 watch: None,
+                count: None,
                 endpoints: config::Layer::default(),
             }
         );
@@ -468,6 +564,7 @@ mod tests {
             parse_args(&args(&["--json", "--watch", "5"])).unwrap(),
             Cli::Json {
                 watch: Some(5),
+                count: None,
                 endpoints: config::Layer::default(),
             }
         );
