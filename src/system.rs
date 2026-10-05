@@ -511,8 +511,15 @@ fn parse_mpt_output(output: &str, data: &mut SystemData) {
             if let Ok(used) = parts[2].parse::<f64>() {
                 data.disk_used_gb = Some(size_to_gb(used, parts[3]));
             }
+            // Only a value that can be a percentage counts as a reading. f64
+            // parsing also accepts NaN, infinities and out-of-range numbers,
+            // and NaN compares false against any threshold, so "NaN%" used to
+            // clear an open disk alert as if the disk had recovered. Anything
+            // else stays unknown, which can neither trip nor clear an alert.
             if let Ok(pct) = parts[4].trim_end_matches('%').parse::<f64>() {
-                data.disk_used_pct = Some(pct);
+                if pct.is_finite() && (0.0..=100.0).contains(&pct) {
+                    data.disk_used_pct = Some(pct);
+                }
             }
         }
 
@@ -580,6 +587,85 @@ mod tests {
         assert_eq!(data.disk_used_pct, Some(6.11));
         assert!((data.disk_capacity_gb.unwrap() - 1.75 * 1024.0).abs() < 1e-6);
         assert!((data.disk_used_gb.unwrap() - 109.30).abs() < 1e-6);
+    }
+
+    fn disk_pct_of(line: &str) -> SystemData {
+        let mut data = SystemData::default();
+        parse_mpt_output(line, &mut data);
+        data
+    }
+
+    #[test]
+    fn an_impossible_disk_percentage_stays_unknown() {
+        for pct in ["NaN", "inf", "-inf", "infinity", "-0.5", "100.01", "250"] {
+            let line = format!(
+                "           1.75 Tb      109.30 Gb  {}%  \"/dev/triedb\"",
+                pct
+            );
+            let data = disk_pct_of(&line);
+            assert_eq!(data.disk_used_pct, None, "{}% was taken as a reading", pct);
+            // Only the percentage is dropped; the sizes on the line still parse.
+            assert!(
+                data.disk_capacity_gb.is_some(),
+                "{}% lost the capacity",
+                pct
+            );
+            assert!(data.disk_used_gb.is_some(), "{}% lost the used size", pct);
+        }
+    }
+
+    #[test]
+    fn a_valid_disk_percentage_is_kept_at_the_edges() {
+        for (pct, expected) in [("0", 0.0), ("100", 100.0), ("6.11", 6.11), ("99.99", 99.99)] {
+            let line = format!(
+                "           1.75 Tb      109.30 Gb  {}%  \"/dev/triedb\"",
+                pct
+            );
+            assert_eq!(disk_pct_of(&line).disk_used_pct, Some(expected), "{}%", pct);
+        }
+    }
+
+    #[test]
+    fn an_invalid_reading_cannot_clear_an_open_disk_alert() {
+        // The reported path: parser -> update_system -> alert_sample -> evaluate.
+        use crate::alerts::{evaluate, AlertConfig, AlertKind, AlertState};
+        use crate::state::AppState;
+
+        let config = AlertConfig {
+            disk_pct: Some(85.0),
+            confirm_samples: 1,
+            cooldown_secs: 0,
+            ..AlertConfig::default()
+        };
+        let mut alerts = AlertState::default();
+        let mut app = AppState::new();
+        let mut poll = |pct: &str| {
+            let line = format!(
+                "           1.75 Tb      109.30 Gb  {}%  \"/dev/triedb\"",
+                pct
+            );
+            app.update_system(disk_pct_of(&line));
+            evaluate(&mut alerts, &config, &app.alert_sample(), 0)
+        };
+
+        let fired = poll("90.00");
+        assert_eq!(fired.len(), 1);
+        assert!(fired[0].firing);
+
+        // Before the fix this emitted a recovery: NaN > 85.0 is false.
+        assert!(
+            poll("NaN").is_empty(),
+            "an invalid reading changed the alert"
+        );
+        assert!(
+            poll("inf").is_empty(),
+            "an invalid reading changed the alert"
+        );
+
+        let recovered = poll("70.00");
+        assert_eq!(recovered.len(), 1);
+        assert!(!recovered[0].firing);
+        assert_eq!(recovered[0].kind, AlertKind::DiskFull);
     }
 
     #[test]
