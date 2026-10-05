@@ -150,14 +150,30 @@ impl Samples for NodeSamples<'_> {
     }
 }
 
+/// What a failed write or flush means for the exit code.
+///
+/// A closed pipe is the reader going away, which the operator asked for, so it
+/// stays a quiet exit 0. Anything else (a full disk, a revoked descriptor, a
+/// writer that cannot flush) is an output that was not delivered, and reporting
+/// success over it would hide a failed capture.
+fn output_failed(e: std::io::Error) -> Result<i32> {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        Ok(0)
+    } else {
+        Err(anyhow::Error::new(e).context("writing JSON watch output"))
+    }
+}
+
 /// Emit NDJSON on every tick, stopping after `count` lines when one is given.
 ///
 /// `count = None` keeps the behaviour this had before it was bounded: stream
 /// until the reader goes away. A closed pipe is still a quiet exit 0 in both
-/// cases — the operator who pressed `head -1` did not ask for a failure. A
-/// completed bounded capture reports the last reading's reachability instead,
-/// matching the one-shot convention, because there the exit status is the
-/// answer rather than an interruption.
+/// cases — the operator who pressed `head -1` did not ask for a failure. Any
+/// other write or flush error is returned, so the process exits nonzero with
+/// the cause. A completed bounded capture reports the last reading's
+/// reachability instead, matching the one-shot convention, because there the
+/// exit status is the answer rather than an interruption; a line only counts
+/// once both its write and its flush have succeeded.
 async fn emit<S: Samples, W: Write>(
     samples: &mut S,
     out: &mut W,
@@ -176,10 +192,12 @@ async fn emit<S: Samples, W: Write>(
     loop {
         ticker.tick().await;
         let (snap, reachable) = samples.next_sample().await;
-        if writeln!(out, "{}", serde_json::to_string(&snap)?).is_err() {
-            return Ok(0);
+        if let Err(e) = writeln!(out, "{}", serde_json::to_string(&snap)?) {
+            return output_failed(e);
         }
-        let _ = out.flush();
+        if let Err(e) = out.flush() {
+            return output_failed(e);
+        }
         emitted += 1;
         if count.is_some_and(|n| emitted >= n) {
             return Ok(if reachable { 0 } else { 1 });
@@ -267,6 +285,32 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// A writer whose `write` fails with the given kind, for output errors that are
+    /// not a closed pipe (a full disk, a revoked descriptor).
+    struct FailingWrite(std::io::ErrorKind);
+
+    impl Write for FailingWrite {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "write failed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that accepts every byte and then fails to flush them, so the line
+    /// was handed over but never delivered.
+    struct FailingFlush(std::io::ErrorKind);
+
+    impl Write for FailingFlush {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(self.0, "flush failed"))
         }
     }
 
@@ -371,6 +415,88 @@ mod tests {
             assert_eq!(
                 samples.asked, 2,
                 "the loop kept reading after the pipe closed (one priming read, one written)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_that_is_not_a_closed_pipe_is_an_error_bounded_or_not() {
+        for count in [None, Some(5)] {
+            let mut samples = ScriptedSamples::always(true);
+            let err = emit_bounded(
+                &mut samples,
+                &mut FailingWrite(std::io::ErrorKind::Other),
+                count,
+            )
+            .await
+            .expect_err(&format!(
+                "count {:?} reported success over a failed write",
+                count
+            ));
+            assert!(
+                format!("{:#}", err).contains("writing JSON watch output"),
+                "count {:?}: error lost its context: {:#}",
+                count,
+                err
+            );
+            assert_eq!(
+                samples.asked, 2,
+                "count {:?}: the loop kept reading after the output failed",
+                count
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_is_an_error_even_when_the_last_sample_was_reachable() {
+        // --count 1 with a reachable sample used to return that sample's status, 0,
+        // although the line never reached its destination.
+        for count in [None, Some(1), Some(5)] {
+            let mut samples = ScriptedSamples::always(true);
+            let err = emit_bounded(
+                &mut samples,
+                &mut FailingFlush(std::io::ErrorKind::Other),
+                count,
+            )
+            .await
+            .expect_err(&format!(
+                "count {:?} reported success over a failed flush",
+                count
+            ));
+            assert!(
+                format!("{:#}", err).contains("flush failed"),
+                "count {:?}: the cause is missing: {:#}",
+                count,
+                err
+            );
+            assert_eq!(
+                samples.asked, 2,
+                "count {:?}: kept reading after the flush failed",
+                count
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_pipe_on_flush_is_as_quiet_as_on_write() {
+        for count in [None, Some(5)] {
+            let mut samples = ScriptedSamples::always(true);
+            let code = emit_bounded(
+                &mut samples,
+                &mut FailingFlush(std::io::ErrorKind::BrokenPipe),
+                count,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                code, 0,
+                "count {:?} turned a closed pipe into a failure",
+                count
+            );
+            assert_eq!(
+                samples.asked, 2,
+                "count {:?}: kept reading after the pipe closed",
+                count
             );
         }
     }
