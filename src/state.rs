@@ -401,16 +401,11 @@ impl AppState {
         let rpc = self.rpc_data.block_number;
 
         // The WebSocket's height leads while the subscription is up. Once it
-        // drops, that number only ages, and the metrics poll is still
-        // reporting; taking the higher of the two keeps the header moving
-        // instead of frozen at the moment the stream died. A height nobody
-        // has read contributes nothing rather than a zero that would pin the
-        // header to the floor.
+        // drops, prefer the answering metrics source, even after a reset to
+        // a lower height or zero. Keep the stored RPC reading as a fallback
+        // only when the metrics height is unknown.
         if !self.ws_connected {
-            return match (rpc, self.metrics.block_num) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (found, None) | (None, found) => found,
-            };
+            return self.metrics.block_num.or(rpc);
         }
         // Prefer RPC block number as it's more accurate. A real zero-height
         // reading (`Some(0)`) is kept as such; only an unread height falls
@@ -1387,6 +1382,109 @@ mod tests {
         assert_eq!(state.block_height(), Some(0));
     }
 
+    #[test]
+    fn disconnected_height_preserves_reset_progress_and_source_fallbacks() {
+        let mut state = AppState::new();
+        state.update_rpc(rpc_at(1_000));
+        let rpc_block_at = state.last_rpc_block_at;
+        state.set_ws_disconnected("gone".to_string());
+
+        for height in [0, 10, 11, 12] {
+            state.update_metrics(PrometheusMetrics {
+                block_num: Some(height),
+                ..Default::default()
+            });
+            assert_eq!(state.block_height(), Some(height));
+            assert_eq!(state.rpc_data.block_number, Some(1_000));
+            assert_eq!(state.last_rpc_block_at, rpc_block_at);
+        }
+
+        state.set_ws_connected();
+        assert_eq!(state.block_height(), Some(1_000));
+        state.set_ws_disconnected("gone".to_string());
+        state.update_metrics(PrometheusMetrics::default());
+        assert_eq!(state.block_height(), Some(1_000));
+
+        state.update_rpc(RpcData::default());
+        assert_eq!(state.block_height(), None);
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(12),
+            ..Default::default()
+        });
+        assert_eq!(state.block_height(), Some(12));
+        state.set_ws_disconnected("gone".to_string());
+        assert_eq!(state.block_height(), Some(12));
+        state.update_metrics(PrometheusMetrics::default());
+        assert_eq!(state.block_height(), None);
+    }
+
+    #[test]
+    fn disconnected_height_reaches_the_serialized_snapshot() {
+        let mut state = AppState::new();
+        state.update_rpc(rpc_at(1_000));
+        state.set_ws_disconnected("gone".to_string());
+        state.update_system(SystemData {
+            external_block: Some(1_005),
+            ..Default::default()
+        });
+
+        for height in [0, 10, 11, 12] {
+            state.update_metrics(PrometheusMetrics {
+                block_num: Some(height),
+                ..Default::default()
+            });
+            let snapshot = crate::snapshot::Snapshot::from_state(&state, "mainnet", true);
+            let json = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(json["block_num"], height);
+            assert_eq!(json["block_height"], height);
+            assert_eq!(json["block_difference"], 1_005 - height);
+        }
+
+        state.update_metrics(PrometheusMetrics::default());
+        let snapshot = crate::snapshot::Snapshot::from_state(&state, "mainnet", true);
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert!(json["block_num"].is_null());
+        assert_eq!(json["block_height"], 1_000);
+        assert_eq!(json["block_difference"], 5);
+
+        state.update_rpc(RpcData::default());
+        let snapshot = crate::snapshot::Snapshot::from_state(&state, "mainnet", true);
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert!(json["block_height"].is_null());
+        assert!(json["block_difference"].is_null());
+    }
+
+    #[test]
+    fn disconnected_height_reaches_the_tui_header() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut state = AppState::new();
+        state.update_rpc(rpc_at(1_000));
+        state.set_ws_disconnected("gone".to_string());
+        state.update_system(SystemData {
+            external_block: Some(1_005),
+            ..Default::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+
+        for height in [0, 10, 11, 12] {
+            state.update_metrics(PrometheusMetrics {
+                block_num: Some(height),
+                ..Default::default()
+            });
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &state))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let height_row: String = (2..61).map(|x| buffer[(x, 3)].symbol()).collect();
+            let comparison_row: String = (2..61).map(|x| buffer[(x, 4)].symbol()).collect();
+            assert_eq!(height_row.trim(), height.to_string());
+            assert!(
+                comparison_row.contains(&format!("Δ-{}", 1_005 - height)),
+                "{comparison_row}"
+            );
+        }
+    }
     #[test]
     fn default_network_is_mainnet() {
         let state = AppState::new();
