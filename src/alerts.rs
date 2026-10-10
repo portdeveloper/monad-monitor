@@ -5,11 +5,12 @@
 //! the refresh ticks in between, so an incident is two webhook messages instead
 //! of a stream. Two things keep a noisy metric from filling a channel: a flip
 //! is only accepted once the new side has held for `confirm_samples`
-//! consecutive evaluations, which absorbs brief crossings, and a threshold that
-//! has already alerted stays quiet for `cooldown_secs`, which absorbs a value
-//! that genuinely drifts back and forth across its threshold for minutes at a
-//! time. A recovery is never held back, so an incident that was announced is
-//! always closed.
+//! consecutive readings, which absorbs brief crossings (a round in which the
+//! value could not be read is not one, and starts that count over), and a
+//! threshold that has already alerted stays quiet for `cooldown_secs`, which
+//! absorbs a value that genuinely drifts back and forth across its threshold
+//! for minutes at a time. A recovery is never held back, so an incident that
+//! was announced is always closed.
 //!
 //! Nothing here writes to the node: a tripped threshold reads state and posts a
 //! notification, which keeps the monitor in its read-only lane.
@@ -183,7 +184,8 @@ fn parse_pct(flag: &str, value: &str) -> Result<f64, String> {
 /// One evaluation's worth of readings. A field is `None` while its source has
 /// not reported yet, and an unknown reading never trips or clears a threshold:
 /// a monitor that just started has not observed a problem, it has observed
-/// nothing.
+/// nothing. It does break a pending confirmation, so the readings that confirm
+/// a change are consecutive measurements rather than two ends of a gap.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sample {
     pub secs_since_block: Option<u64>,
@@ -213,6 +215,15 @@ struct Entry {
 }
 
 impl Entry {
+    /// A round with no reading for this threshold. Confirmation counts
+    /// *consecutive* evaluations, and a gap with no evidence is not one, so the
+    /// pending streak starts over. Everything else stays: an active incident, its
+    /// announced state and its cooldown survive the gap, and missing data can
+    /// neither fire nor resolve anything on its own.
+    fn unknown(&mut self) {
+        self.streak = 0;
+    }
+
     /// Feeds one reading in and reports the notification it warrants, if any.
     fn observe(&mut self, breached: bool, confirm: u32, cooldown: u64, now: u64) -> Option<Notify> {
         if breached == self.tripped {
@@ -356,7 +367,13 @@ pub fn evaluate(
     let cooldown = config.cooldown_secs;
     let mut transitions = Vec::new();
 
-    let mut check = |kind: AlertKind, breached: bool, value: String, threshold: String| {
+    // `None` is a configured threshold with no reading this round: it only
+    // breaks that threshold's pending streak (see `Entry::unknown`).
+    let mut check = |kind: AlertKind, reading: Option<(bool, String, String)>| {
+        let Some((breached, value, threshold)) = reading else {
+            state.entry(kind).unknown();
+            return;
+        };
         if let Some(notify) = state.entry(kind).observe(breached, confirm, cooldown, now) {
             transitions.push(Transition {
                 kind,
@@ -367,39 +384,51 @@ pub fn evaluate(
         }
     };
 
-    if let (Some(limit), Some(secs)) = (config.no_block_secs, sample.secs_since_block) {
+    if let Some(limit) = config.no_block_secs {
         check(
             AlertKind::NoBlock,
-            secs >= limit,
-            format!("{}s since the last block", secs),
-            format!("{}s", limit),
+            sample.secs_since_block.map(|secs| {
+                (
+                    secs >= limit,
+                    format!("{}s since the last block", secs),
+                    format!("{}s", limit),
+                )
+            }),
         );
     }
 
-    if let (Some(limit), Some(lag)) = (config.finalized_lag, sample.finalized_lag) {
+    if let Some(limit) = config.finalized_lag {
         check(
             AlertKind::FinalizedLag,
-            lag > limit,
-            format!("{} blocks", lag),
-            format!("{} blocks", limit),
+            sample.finalized_lag.map(|lag| {
+                (
+                    lag > limit,
+                    format!("{} blocks", lag),
+                    format!("{} blocks", limit),
+                )
+            }),
         );
     }
 
-    if let (Some(limit), Some(peers)) = (config.min_peers, sample.peers) {
+    if let Some(limit) = config.min_peers {
         check(
             AlertKind::LowPeers,
-            peers < limit,
-            format!("{} peers", peers),
-            format!("{} peers", limit),
+            sample.peers.map(|peers| {
+                (
+                    peers < limit,
+                    format!("{} peers", peers),
+                    format!("{} peers", limit),
+                )
+            }),
         );
     }
 
-    if let (Some(limit), Some(pct)) = (config.disk_pct, sample.disk_pct) {
+    if let Some(limit) = config.disk_pct {
         check(
             AlertKind::DiskFull,
-            pct > limit,
-            format!("{:.1}%", pct),
-            format!("{}%", limit),
+            sample
+                .disk_pct
+                .map(|pct| (pct > limit, format!("{:.1}%", pct), format!("{}%", limit))),
         );
     }
 
@@ -477,6 +506,119 @@ mod tests {
         for _ in 0..10 {
             assert!(evaluate(&mut state, &config, &peers(1), 0).is_empty());
         }
+    }
+
+    /// A round in which nothing could be read.
+    fn unknown() -> Sample {
+        Sample::default()
+    }
+
+    #[test]
+    fn an_unknown_reading_restarts_a_pending_firing_streak() {
+        // The issue's reproduction: one low reading starts confirmation, a long gap
+        // follows, and one more low reading used to fire at once, although the two
+        // "consecutive" measurements had nothing but missing data between them.
+        let config = config();
+        let mut state = AlertState::default();
+
+        assert!(evaluate(&mut state, &config, &peers(1), 0).is_empty());
+        for _ in 0..10 {
+            assert!(evaluate(&mut state, &config, &unknown(), 0).is_empty());
+        }
+        assert!(
+            evaluate(&mut state, &config, &peers(1), 0).is_empty(),
+            "fired on one fresh reading after a gap"
+        );
+        assert!(!state.is_tripped(AlertKind::LowPeers));
+
+        let fired = evaluate(&mut state, &config, &peers(1), 0);
+        assert_eq!(fired.len(), 1, "two fresh consecutive readings must fire");
+        assert!(fired[0].firing);
+    }
+
+    #[test]
+    fn an_unknown_reading_restarts_a_pending_recovery_streak() {
+        let config = config();
+        let mut state = AlertState::default();
+        evaluate(&mut state, &config, &peers(1), 0);
+        evaluate(&mut state, &config, &peers(1), 0);
+        assert!(state.is_tripped(AlertKind::LowPeers));
+
+        assert!(evaluate(&mut state, &config, &peers(50), 0).is_empty());
+        assert!(evaluate(&mut state, &config, &unknown(), 0).is_empty());
+        assert!(
+            evaluate(&mut state, &config, &peers(50), 0).is_empty(),
+            "resolved on one fresh reading after a gap"
+        );
+        assert!(state.is_tripped(AlertKind::LowPeers));
+
+        let recovered = evaluate(&mut state, &config, &peers(50), 0);
+        assert_eq!(
+            recovered.len(),
+            1,
+            "two fresh consecutive readings must resolve"
+        );
+        assert!(!recovered[0].firing);
+    }
+
+    #[test]
+    fn an_active_incident_and_its_cooldown_survive_unknown_readings() {
+        let config = AlertConfig {
+            cooldown_secs: 100,
+            ..config()
+        };
+        let mut state = AlertState::default();
+        evaluate(&mut state, &config, &peers(1), 0);
+        assert_eq!(evaluate(&mut state, &config, &peers(1), 0).len(), 1);
+
+        // Missing data neither resolves the incident nor fires anything.
+        for t in 1..=10 {
+            assert!(evaluate(&mut state, &config, &unknown(), t).is_empty());
+            assert!(state.is_tripped(AlertKind::LowPeers));
+        }
+
+        // The incident was announced, so its recovery is still reported.
+        evaluate(&mut state, &config, &peers(50), 11);
+        let recovered = evaluate(&mut state, &config, &peers(50), 12);
+        assert_eq!(recovered.len(), 1);
+        assert!(!recovered[0].firing);
+
+        // And the cooldown from the original firing still holds.
+        evaluate(&mut state, &config, &peers(1), 20);
+        assert!(
+            evaluate(&mut state, &config, &peers(1), 21).is_empty(),
+            "the cooldown was forgotten across the gap"
+        );
+        assert!(state.is_tripped(AlertKind::LowPeers));
+    }
+
+    #[test]
+    fn a_gap_in_one_metric_does_not_reset_another_metrics_streak() {
+        let config = config();
+        let mut state = AlertState::default();
+        let both = Sample {
+            peers: Some(1),
+            disk_pct: Some(90.0),
+            ..Sample::default()
+        };
+        let disk_only = Sample {
+            peers: None,
+            disk_pct: Some(90.0),
+            ..Sample::default()
+        };
+
+        assert!(evaluate(&mut state, &config, &both, 0).is_empty());
+        let fired = evaluate(&mut state, &config, &disk_only, 0);
+        assert_eq!(
+            fired.len(),
+            1,
+            "the disk streak was broken by the peers gap"
+        );
+        assert_eq!(fired[0].kind, AlertKind::DiskFull);
+        assert!(!state.is_tripped(AlertKind::LowPeers));
+
+        // The peers streak did restart: one more low reading is not enough.
+        assert!(evaluate(&mut state, &config, &peers(1), 0).is_empty());
     }
 
     #[test]
