@@ -30,6 +30,10 @@ pub struct Snapshot {
     pub timestamp_ms: u64,
     pub network: String,
     pub node_reachable: bool,
+    /// Whether the node's WebSocket answered this reading. `node_reachable`
+    /// is already true when only the metrics scrape answers, so without this
+    /// a failed RPC read looked like a healthy one with a few empty fields.
+    pub rpc_reachable: bool,
     /// `null` when neither the RPC nor the metrics scrape reported a height, so
     /// a script can tell a node at genesis from one that has not been read.
     pub block_height: Option<u64>,
@@ -62,6 +66,7 @@ impl Snapshot {
             timestamp_ms: now_ms(),
             network: network.to_string(),
             node_reachable,
+            rpc_reachable: state.ws_connected,
             block_height,
             synced: state.metrics.is_synced(),
             sync_percentage: state.metrics.sync_percentage(),
@@ -741,6 +746,82 @@ mod tests {
         state.update_rpc(data);
         let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
         assert_eq!(v["gas_price_gwei"], 2.0);
+    }
+
+    /// A loopback address nothing listens on: bound, then released, so a
+    /// connect is refused at once instead of waiting out a timeout.
+    fn refused_addr() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        listener.local_addr().expect("read local addr")
+    }
+
+    /// Answer one metrics scrape with `body`, then return the endpoint URL.
+    fn serve_metrics_once(body: &str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("read local addr");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/metrics")
+    }
+
+    #[tokio::test]
+    async fn a_websocket_that_does_not_answer_is_reported_next_to_reachable_metrics() {
+        // The setup from #77: metrics answer, nothing listens on the WebSocket.
+        // The node is still reachable, but the reading must say the RPC half
+        // of it is missing.
+        let metrics = MetricsClient::new(&serve_metrics_once(
+            "monad_execution_ledger_block_num 70636215\n",
+        ));
+        let mut system = SystemClient::new(&format!("ws://{}", refused_addr()));
+        let rpc = RpcClient::new(&format!("ws://{}", refused_addr()));
+
+        let mut state = AppState::new();
+        let reachable = collect(&mut state, &metrics, &mut system, &rpc).await;
+        let v = serde_json::to_value(Snapshot::from_state(&state, "testnet", reachable)).unwrap();
+
+        assert_eq!(v["node_reachable"], true);
+        assert_eq!(v["rpc_reachable"], false);
+        assert_eq!(v["block_height"], 70636215, "height from metrics");
+    }
+
+    #[test]
+    fn rpc_reachable_follows_the_latest_reading() {
+        // A watch run keeps one state across readings: a failed read clears
+        // the flag and the next answered one sets it again.
+        let mut state = AppState::new();
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", false)).unwrap();
+        assert_eq!(v["rpc_reachable"], false, "nothing has been read yet");
+
+        state.update_rpc(RpcData {
+            block_number: Some(10),
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(v["rpc_reachable"], true);
+
+        state.set_ws_disconnected("RPC endpoint did not answer".to_string());
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(v["rpc_reachable"], false);
+
+        state.update_rpc(RpcData {
+            block_number: Some(11),
+            ..Default::default()
+        });
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(v["rpc_reachable"], true);
     }
 
     #[test]

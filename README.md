@@ -57,6 +57,8 @@ monad-monitor --json
 
 The exit status is non-zero when the node is unreachable, so a check can alert on it.
 
+`node_reachable` is true when either the metrics endpoint or the WebSocket answered. `rpc_reachable` says whether the WebSocket did; when it is false, `gas_price_gwei` and `client_version` were not read and `block_height` comes from the metrics scrape.
+
 A stream of snapshots, one JSON object per line (NDJSON), every five seconds until interrupted:
 
 ```bash
