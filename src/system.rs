@@ -223,6 +223,12 @@ impl SystemClient {
             match msg {
                 Ok(Message::Text(text)) => {
                     let response: serde_json::Value = serde_json::from_str(&text)?;
+                    if response["id"] != request["id"] {
+                        continue;
+                    }
+                    if response.get("error").is_some() {
+                        anyhow::bail!("External node returned an error for eth_blockNumber");
+                    }
                     let hex = response["result"]
                         .as_str()
                         .context("External node did not answer eth_blockNumber with a height")?;
@@ -566,6 +572,170 @@ fn parse_mpt_output(output: &str, data: &mut SystemData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn external_reply(frames: Vec<Message>) -> Result<u64> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap(),
+                json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1})
+            );
+            for frame in frames {
+                if ws.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            let _ = ws.close(None).await;
+        });
+        let result = timeout(
+            EXTERNAL_TIMEOUT,
+            SystemClient::new(&format!("ws://{address}")).fetch_external_block(),
+        )
+        .await;
+        let completed = timeout(Duration::from_secs(1), &mut server).await;
+        if completed.is_err() {
+            server.abort();
+        }
+        completed
+            .expect("fixture did not finish")
+            .expect("fixture panicked");
+        result.expect("external read timed out")
+    }
+
+    fn text(value: serde_json::Value) -> Message {
+        Message::Text(value.to_string())
+    }
+
+    #[tokio::test]
+    async fn external_height_skips_unrelated_replies_and_notifications() {
+        let frames = vec![
+            text(json!({"jsonrpc": "2.0", "id": 99, "result": "0x64"})),
+            text(json!({"jsonrpc": "2.0", "id": "1", "result": "0x64"})),
+            text(json!({"jsonrpc": "2.0", "id": null, "result": "0x64"})),
+            text(
+                json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {}, "result": "0x64"}),
+            ),
+            text(json!({"jsonrpc": "2.0", "id": 99, "error": {"code": -32000}})),
+            Message::Ping(vec![1]),
+            Message::Binary(vec![1]),
+            text(json!({"jsonrpc": "2.0", "id": 1, "result": "0x2a"})),
+        ];
+        assert_eq!(external_reply(frames).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn external_height_rejects_matching_errors_even_with_a_result() {
+        for error in [json!({"code": -32000, "message": "failed"}), json!(null)] {
+            for result in [json!("0x64"), json!(null)] {
+                let frames = vec![
+                    text(json!({"jsonrpc": "2.0", "id": 1, "error": error, "result": result})),
+                    text(json!({"jsonrpc": "2.0", "id": 1, "result": "0x2a"})),
+                ];
+                assert!(external_reply(frames).await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_height_rejects_unreadable_matching_results() {
+        for result in [
+            json!(null),
+            json!(42),
+            json!(""),
+            json!("0x"),
+            json!("latest"),
+            json!("0x10000000000000000"),
+        ] {
+            let frames = vec![
+                text(json!({"jsonrpc": "2.0", "id": 1, "result": result})),
+                text(json!({"jsonrpc": "2.0", "id": 1, "result": "0x2a"})),
+            ];
+            assert!(external_reply(frames).await.is_err());
+        }
+        assert!(
+            external_reply(vec![text(json!({"jsonrpc": "2.0", "id": 1}))])
+                .await
+                .is_err()
+        );
+        assert!(external_reply(vec![Message::Text("{".into())])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn external_height_needs_a_matching_answer_before_close() {
+        for frames in [
+            vec![],
+            vec![text(json!({"jsonrpc": "2.0", "id": 99, "result": "0x64"}))],
+            vec![text(
+                json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {}}),
+            )],
+        ] {
+            assert!(external_reply(frames).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn external_height_keeps_valid_zero_and_existing_hex_parsing() {
+        for (result, expected) in [
+            ("0x0", 0),
+            ("0x2a", 42),
+            ("2a", 42),
+            ("0xffffffffffffffff", u64::MAX),
+        ] {
+            assert_eq!(
+                external_reply(vec![text(
+                    json!({"jsonrpc": "2.0", "id": 1, "result": result})
+                )])
+                .await
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_height_correlation_reaches_the_snapshot() {
+        use crate::metrics::PrometheusMetrics;
+        use crate::snapshot::Snapshot;
+        use crate::state::AppState;
+
+        for (answer, expected) in [
+            (json!({"id": 1, "result": "0x2a"}), Some(0)),
+            (json!({"id": 1, "result": "0x29"}), Some(-1)),
+            (json!({"id": 1, "result": "0x0"}), Some(-42)),
+            (
+                json!({"id": 1, "error": {"code": -32000}, "result": "0x64"}),
+                None,
+            ),
+            (json!({"id": 1, "result": "bad height"}), None),
+        ] {
+            let external_block = external_reply(vec![
+                text(json!({"id": 99, "result": "0x64"})),
+                text(answer),
+            ])
+            .await
+            .ok();
+            let mut state = AppState::new();
+            state.update_metrics(PrometheusMetrics {
+                block_num: Some(42),
+                ..Default::default()
+            });
+            state.update_system(SystemData {
+                external_block,
+                ..Default::default()
+            });
+            let snapshot = Snapshot::from_state(&state, "testnet", true);
+            assert_eq!(snapshot.block_difference, expected);
+            let value = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(value["block_difference"], json!(expected));
+            assert_eq!(value["external_block"], json!(external_block));
+        }
+    }
 
     #[test]
     fn disk_line_used_in_terabytes() {
