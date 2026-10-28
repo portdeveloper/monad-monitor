@@ -470,6 +470,28 @@ fn draw_sparkline(frame: &mut Frame, area: Rect, state: &AppState, label_color: 
     frame.render_widget(sparkline, area);
 }
 
+/// The nine-cell gas bar and its percentage overlay: `███47%░░░`.
+///
+/// A block cannot spend more gas than its limit allows, but nothing in the RPC
+/// decode enforces that, so a node can still answer with any pair of `u64`s.
+/// The derived percentage is clamped so an impossible pair cannot stretch the
+/// bar past its column, and the space left for the bar characters is taken with
+/// `saturating_sub` so the formatting itself cannot underflow.
+fn render_gas_bar(gas_used: u64, gas_limit: u64) -> String {
+    let gas_pct = if gas_limit > 0 {
+        ((gas_used as f64 / gas_limit as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    let pct_str = format!("{:.0}%", gas_pct);
+    let bar_total: usize = 9; // Total width
+    let bar_space = bar_total.saturating_sub(pct_str.len());
+    let filled = (((gas_pct / 100.0) * bar_space as f64).round() as usize).min(bar_space);
+    let empty = bar_space.saturating_sub(filled);
+    format!("{}{}{}", "█".repeat(filled), pct_str, "░".repeat(empty))
+}
+
 fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState, label_color: Color, text_dim: Color) {
     // Split area for Christmas tree if theme is active
     let (blocks_area, tree_area) = if state.theme == Theme::Christmas && area.width > 80 {
@@ -528,20 +550,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &AppState, label_color: Col
                 "...".to_string()
             };
 
-            let gas_pct = if b.gas_limit > 0 {
-                (b.gas_used as f64 / b.gas_limit as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            // Gas bar with percentage overlay: "███47%░░░"
-            let pct_str = format!("{:.0}%", gas_pct);
-            let bar_total = 9; // Total width
-            let pct_len = pct_str.len();
-            let bar_space = bar_total - pct_len; // Space for bar chars
-            let filled = ((gas_pct / 100.0) * bar_space as f64).round() as usize;
-            let empty = bar_space.saturating_sub(filled);
-            let gas_bar = format!("{}{}{}", "█".repeat(filled), pct_str, "░".repeat(empty));
+            let gas_bar = render_gas_bar(b.gas_used, b.gas_limit);
 
             Row::new(vec![
                 format!("#{}", format_number(b.number)),
@@ -1061,6 +1070,60 @@ mod tests {
                 "{progress:?}/{target:?}: drew {absent:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_block_that_spends_more_gas_than_its_limit_stays_inside_the_gas_column() {
+        // A node is free to answer with any pair of u64s. A gas bar whose
+        // percentage string is longer than the cell it is drawn into used to
+        // underflow the space left for the bar; the whole row now stays at the
+        // nine cells the column asks for.
+        for (gas_used, gas_limit) in [(2, 1), (u64::MAX, 1)] {
+            let bar = render_gas_bar(gas_used, gas_limit);
+            assert_eq!(
+                bar.chars().count(),
+                9,
+                "{gas_used}/{gas_limit} rendered {bar:?}"
+            );
+            assert!(
+                bar.contains("100%"),
+                "{gas_used}/{gas_limit} did not clamp to a full bar: {bar:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_normal_gas_reading_keeps_its_percentage() {
+        for (gas_used, gas_limit, expected) in
+            [(0, 100, "0%"), (50, 100, "50%"), (100, 100, "100%")]
+        {
+            let bar = render_gas_bar(gas_used, gas_limit);
+            assert_eq!(bar.chars().count(), 9, "{bar:?}");
+            assert!(bar.contains(expected), "{bar:?} lost {expected}");
+        }
+    }
+
+    #[test]
+    fn a_block_with_no_gas_limit_reads_as_zero() {
+        let bar = render_gas_bar(1_000, 0);
+        assert_eq!(bar.chars().count(), 9, "{bar:?}");
+        assert!(bar.contains("0%"), "{bar:?}");
+    }
+
+    #[test]
+    fn the_block_table_draws_an_over_limit_gas_reading() {
+        let mut state = AppState::new();
+        state.rpc_data.recent_blocks.push(crate::rpc::Block {
+            number: 1,
+            hash: format!("0x{}", "ab".repeat(32)),
+            tx_count: 1,
+            timestamp: 1,
+            gas_used: u64::MAX,
+            gas_limit: 1,
+        });
+
+        let rows = render_rows(&state);
+        assert!(rows.iter().any(|row| row.contains("100%")));
     }
 
     #[test]
